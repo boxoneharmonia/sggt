@@ -1,0 +1,8 @@
+weights
+log
+__pycache__
+dinov2-*
+tomb.py
+*.ipynb
+nerf/*
+*_nerf*
