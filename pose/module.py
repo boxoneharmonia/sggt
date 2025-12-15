@@ -555,7 +555,7 @@ class DPTHead(nn.Module):
         )
         self.outconf = nn.Conv2d(in_channels=features, out_channels=1, kernel_size=1, stride=1, padding=0) if use_conf is True else None
     
-    def forward(self, token_list, image_size, frames_chunk_size=8):
+    def forward(self, token_list, image_size, frames_chunk_size=2):
         B, S, N, C = token_list[0].shape
         H, W = image_size
         patch_h, patch_w = H // self.patch_size, W // self.patch_size

@@ -55,37 +55,14 @@ class MyDataset(Dataset):
         R_cam = SE3_matrix[:3,:3]
         t_cam = SE3_matrix[:3,3:]
 
-        y_coords, x_coords = torch.where(mask.squeeze(0) > 0)
-        ymin = int(y_coords.min() * 0.95)
-        ymax = int(y_coords.max() * 1.05)
-        xmin = int(x_coords.min() * 0.95)
-        xmax = int(x_coords.max() * 1.05)
-        width = xmax - xmin
-        height = ymax - ymin
-        center_x = (xmin + xmax) / 2.0
-        center_y = (ymin + ymax) / 2.0
-        if self.is_train:
-            center_x = center_x + random.uniform(-0.01, 0.01) * width
-            center_y = center_y + random.uniform(-0.01, 0.01) * height
-            width = random.uniform(0.9, 1.0) * width
-            height = random.uniform(0.9, 1.0) * height
-        crop_size = int(max(width, height))
-        xmin = int(center_x - crop_size / 2.0)
-        ymin = int(center_y - crop_size / 2.0)
-        xmin = max(0, min(xmin, orig_w - crop_size))
-        ymin = max(0, min(ymin, orig_h - crop_size))
-        xmax = xmin + crop_size
-        ymax = ymin + crop_size
-        bbox = torch.tensor([xmin/orig_w, ymin/orig_h, xmax/orig_w, ymax/orig_h]).float()
-
         target_h, target_w = self.size
-        scale_x = target_w / crop_size
-        scale_y = target_h / crop_size
+        scale_x = target_w / orig_w
+        scale_y = target_h / orig_h
 
-        image = T.resized_crop(image, ymin, xmin, crop_size, crop_size, self.size, interpolation=T.InterpolationMode.BILINEAR)
+        image = T.resize(image, self.size, interpolation=T.InterpolationMode.BILINEAR)
         if self.is_train and self.transform is not None:
             image = self.transform(image)
-        mask = T.resized_crop(mask, ymin, xmin, crop_size, crop_size, self.size, interpolation=T.InterpolationMode.NEAREST_EXACT)
+        mask = T.resize(mask, self.size, interpolation=T.InterpolationMode.NEAREST_EXACT)
         mask = (mask > 0).float()
     
         pts3d_orig_np = np.array(self.pts3d)
@@ -93,13 +70,15 @@ class MyDataset(Dataset):
         pts3d_all_np = np.concatenate([pts3d_orig_np, pts3d_sampled_np], axis=0)
         pts3d_all = torch.from_numpy(pts3d_all_np).float() / 1000.0
 
+        cam_K[0, :] *= scale_x
+        cam_K[1, :] *= scale_y
         K_tensor = torch.from_numpy(cam_K).float()
         pts_cam_all = pts3d_all @ R_cam.t() + t_cam.view(1, 3)
         pts_proj_all = pts_cam_all @ K_tensor.t()
         pts2d_orig_all = pts_proj_all[:, :2] / (pts_proj_all[:, 2:3] + 1e-5)
         pts2d_all = torch.zeros_like(pts2d_orig_all)
-        pts2d_all[:, 0] = (pts2d_orig_all[:, 0] - xmin) * scale_x
-        pts2d_all[:, 1] = (pts2d_orig_all[:, 1] - ymin) * scale_y
+        pts2d_all[:, 0] = pts2d_orig_all[:, 0]
+        pts2d_all[:, 1] = pts2d_orig_all[:, 1]
         pts2d_corner = pts2d_all[:8]
 
         is_in_w = (pts2d_corner[:, 0] >= 0) & (pts2d_corner[:, 0] < target_w)
@@ -129,20 +108,7 @@ class MyDataset(Dataset):
             point_cloud = point_hwc.permute(2, 0, 1).contiguous()
             point_conf[:, v_sorted, u_sorted] = 1.0
 
-        fx_orig = cam_K[0, 0]
-        fov_new = 2 * np.atan(crop_size/2/fx_orig)
-        cx_orig = cam_K[0, 2]
-        cy_orig = cam_K[1, 2]
-        cx_crop = cx_orig - xmin
-        cy_crop = cy_orig - ymin
-        cx_new = cx_crop * scale_x
-        cy_new = cy_crop * scale_y
-        delta_cx = (cx_new - target_w / 2.0) / (target_w / 2.0)
-        delta_cy = (cy_new - target_h / 2.0) / (target_h / 2.0)
-
-        cam_K_new = torch.tensor([fov_new, delta_cx, delta_cy])
-
-        return image, mask, bbox, R_cam, t_cam, pts2d_corner, pts_vis, point_cloud, point_conf, cam_K_new
+        return image, mask, R_cam, t_cam, pts2d_corner, pts_vis, point_cloud, point_conf, K_tensor
     
     def __len__(self):
         return len(self.index_map)
@@ -150,31 +116,29 @@ class MyDataset(Dataset):
     def __getitem__(self, idx):
         seq_name, first_idx = self.index_map[idx]
         selected_indices = [first_idx] + [i for i in range(first_idx-self.sequence_length+1, first_idx)][::-1]
-        images, masks, bboxes, R_cams, t_cams, pts2d, pts_vis, pclouds, pconfs, cams = [], [], [], [], [], [], [], [], [], []
+        images, masks, R_cams, t_cams, pts2d, pts_vis, pclouds, pconfs, cam_Ks = [], [], [], [], [], [], [], [], []
         for current_idx in selected_indices:
-            image, mask, bbox, R_cam, t_cam, pts, vis, pcloud, pconf, cam = self.get_one_img(seq_name, str(current_idx))
+            image, mask, R_cam, t_cam, pts, vis, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx))
             images.append(image)
             masks.append(mask)
-            bboxes.append(bbox)
             R_cams.append(R_cam)
-            t_cams.append(t_cam/self.scale)
+            t_cams.append(t_cam)
             pts2d.append(pts)
             pts_vis.append(vis)
-            pclouds.append(pcloud/self.scale)
+            pclouds.append(pcloud)
             pconfs.append(pconf)
-            cams.append(cam)
+            cam_Ks.append(cam_K)
 
         ret_dict = {
             'images': torch.stack(images, dim=0),
             'masks': torch.stack(masks, dim=0),
-            'bboxes': torch.stack(bboxes, dim=0),
             'R_cams': torch.stack(R_cams, dim=0),
             't_cams': torch.stack(t_cams, dim=0),
             'pts2d': torch.stack(pts2d, dim=0),
             'pts_vis': torch.stack(pts_vis, dim=0),
             'pclouds': torch.stack(pclouds, dim=0),
             'pconfs': torch.stack(pconfs, dim=0),
-            'cams': torch.stack(cams, dim=0),
+            'cam_Ks': torch.stack(cam_Ks, dim=0),
         }
         return ret_dict
 

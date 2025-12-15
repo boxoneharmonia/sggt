@@ -35,7 +35,7 @@ class Config:
         self.batch_size = 1
         self.num_workers = 6
         self.original_size = [336,336]
-        self.scale = 2.0
+        self.scale = 1.0
 
         # Optimizer configuration
         self.optimizer = 'adamw'
@@ -44,12 +44,12 @@ class Config:
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.999
         self.momentum = 0.99
-        self.z_beta = 0.1
-        self.z_weight = 2.0
+
+        self.t_weight = 1.0
         self.R_beta = 1.0
         self.R_weight = 0.5
+        self.geo_weight = 1.0
         self.mask_weight = 1.0
-        self.cam_weight = 1.0
         self.pts_weight = 1.0
         self.var_weight = 0.1
         self.pcloud_alpha = 0.2
