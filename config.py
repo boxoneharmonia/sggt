@@ -28,8 +28,8 @@ class Config:
 
         # Dataset configuration
         self.root = '../SwissCube/'
-        self.training = 'training_sequences.json'
-        self.testing = 'testing_sequences.json'
+        self.training = 'training_sequences'
+        self.testing = 'testing_sequences'
         self.ptsfile = 'swisscube_bbox.json'
         self.seq_len = 8
         self.batch_size = 1
@@ -50,8 +50,6 @@ class Config:
         self.R_weight = 0.5
         self.geo_weight = 1.0
         self.mask_weight = 1.0
-        self.pts_weight = 1.0
-        self.var_weight = 0.1
         self.pcloud_alpha = 0.2
         self.pcloud_weight = 1.0
         self.pconf_weight = 1.0

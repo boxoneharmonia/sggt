@@ -87,45 +87,57 @@ class Decoder(nn.Module):
         self.map_head = DPTHead(inp=config.embed_dim, oup=config.maps, hidden_ratio=config.mlp_ratio//2, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
         self.pmap_head = DPTHead(inp=config.embed_dim, oup=3, hidden_ratio=config.mlp_ratio//2, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
         features_len = len(config.feature_idx)
-        self.cam_route = nn.Parameter(torch.full([features_len, 1], 1.))
-        self.map_route = nn.Parameter(torch.full([features_len, 4], 1.))
-        self.pmap_route = nn.Parameter(torch.full([features_len, 4], 1.))
+        self.cam_router = DynamicRouter(config.embed_dim, features_len)
+        self.map_routers = nn.ModuleList([
+            DynamicRouter(config.embed_dim, features_len) for _ in range(4)
+        ])
+        self.pmap_routers = nn.ModuleList([
+            DynamicRouter(config.embed_dim, features_len) for _ in range(4)
+        ])
 
     def forward(self, cam_token_list, features_list_all, image_size):
-        cam_token = self._apply_routing(cam_token_list, self.cam_route)[0]
+        global_context = cam_token_list[-1]
+        cam_weights = self.cam_router(global_context) 
+        cam_token = self._apply_dynamic_routing(cam_token_list, cam_weights)
         cam = self.cam_decoder(cam_token)
         pose_R_6d = self.R_head(cam)
         pose_R = rotation_6d_to_matrix(pose_R_6d) # (b s 3 3)
         pose_t = self.t_head(cam) # (b s 3)
         pose = torch.cat([pose_R, pose_t[..., None]], dim=-1)
-        map_features  = self._apply_routing(features_list_all, self.map_route)
-        pmap_features = self._apply_routing(features_list_all, self.pmap_route)
-        maps = self.map_head(map_features, image_size)
+        map_features_input = []
+        for router in self.map_routers:
+            w = router(global_context) # (B, S, L, 1)
+            feat = self._apply_dynamic_routing(features_list_all, w) # (B, S, N, C)
+            map_features_input.append(feat)
+            
+        pmap_features_input = []
+        for router in self.pmap_routers:
+            w = router(global_context)
+            feat = self._apply_dynamic_routing(features_list_all, w)
+            pmap_features_input.append(feat)
+
+        maps = self.map_head(map_features_input, image_size)
         mask = maps[:, :, -1:]
-        heatmap = maps[:, :, :-1]
-        pmap = self.pmap_head(pmap_features, image_size)
-        return pose, mask, heatmap, pmap
-    
-    def _apply_routing(self, features_list, route_weights):
+        pvmap = maps[:, :, :-1]
+        pmap = self.pmap_head(pmap_features_input, image_size)
+        return pose, mask, pvmap, pmap
+
+    def _apply_dynamic_routing(self, features_list, weights):
         """
         Args:
-            features_list: List of L tensors, each (B, S, N, C)
-            route_weights: Parameter of shape (L, l)
+            features_list: List of L tensors, each (B, S, ..., C)
+            weights: Tensor of shape (B, S, L, 1)
         Returns:
-            routed_features: List of l tensors, each (B, S, N, C)
+            fused_feature: (B, S, ..., C)
         """
-        weights = F.softmax(route_weights, dim=0)
-        out_dim = weights.shape[1]
+        # Stack features: (B, S, L, ..., C)
+        stacked_feats = torch.stack(features_list, dim=2)
         
-        routed_features = []
-        for k in range(out_dim): 
-            weighted_feat = 0
-            for i, feat in enumerate(features_list):
-                w = weights[i, k]
-                weighted_feat = weighted_feat + feat * w
-            routed_features.append(weighted_feat)
-            
-        return routed_features
+        # weights: (B, S, L, 1) -> (B, S, L, 1, 1) if N exists
+        while weights.ndim < stacked_feats.ndim:
+            weights = weights.unsqueeze(-1)
+        fused = (stacked_feats * weights).sum(dim=2)
+        return fused
     
 class MyNet(nn.Module):
     def __init__(self, config):
@@ -135,11 +147,11 @@ class MyNet(nn.Module):
 
     def forward(self, x:torch.Tensor):
         cam_token_list, features_list, image_size = self.encoder(x)
-        pose, mask, heatmap, pmap = self.decoder(cam_token_list, features_list, image_size)
+        pose, mask, pvmap, pmap = self.decoder(cam_token_list, features_list, image_size)
         out_dict = {
             'poses': pose,
             'masks': mask,
-            'heatmaps': heatmap,
+            'pvmaps': pvmap,
             'pmaps': pmap
         }
         return out_dict
@@ -159,8 +171,6 @@ class PoseLoss(nn.Module):
         self.R_weight = config.R_weight
         self.geo_weight = config.geo_weight
         self.mask_weight = config.mask_weight
-        self.pts_weight = config.pts_weight
-        self.var_weight = config.var_weight
         self.pcloud_weight = config.pcloud_weight
         self.pconf_weight = config.pconf_weight
 
@@ -181,40 +191,26 @@ class PoseLoss(nn.Module):
         cos_theta = ((traces - 1) / 2.0).clamp(min=-1+eps, max=1-eps)
         theta = torch.acos(cos_theta)
         loss_R = self.lossfn_R(theta, torch.zeros_like(theta))
-        # 2) add
-        pts3d = self.pts3d.to(R_cams.device)
-        pts3d = pts3d.unsqueeze(0).expand(R_cams.shape[0], -1, -1)
-        pts3d_gt = pts3d @ R_cams.transpose(-1, -2) + t_cams.view(-1, 1, 3)
-        pts3d_pred = pts3d @ R_preds.transpose(-1, -2) + t_preds.view(-1, 1, 3)
-        loss_add = self.lossfn_t(pts3d_pred, pts3d_gt)
-        # 3) Wide-Depth-Range 
-        cam_Ks = data_dict['cam_Ks'].flatten(0, 1)
-        pts2d_gt = data_dict['pts2d'].flatten(0, 1)
-        pts2d_homo = torch.cat([pts2d_gt, torch.ones_like(pts2d_gt[..., :1])], dim=-1)
-        K_inv = torch.linalg.inv(cam_Ks)
-        rays = pts2d_homo @ K_inv.transpose(-1, -2)
-        rays_norm = F.normalize(rays, p=2, dim=-1)
-        dot_prod = F.relu(pts3d_pred * rays_norm).sum(dim=-1, keepdim=True) 
-        proj_on_ray = dot_prod * rays_norm
-        dist_vec = pts3d_pred - proj_on_ray
-        loss_geo = self.lossfn_t(dist_vec, torch.zeros_like(dist_vec))
-        # 4) mask
+        # 2) mask
         masks_pred = out_dict['masks'].flatten(0, 1)
         masks_gt = data_dict['masks'].flatten(0, 1)
         size = masks_pred.shape[-2:]
         masks_gt = F.interpolate(masks_gt, size, mode='nearest-exact')
         loss_mask = self.lossfn_bce_mask(masks_pred, masks_gt)
-        # 5) pts2d
-        _, _, _, H, W = data_dict['images'].shape
-        heatmaps = out_dict['heatmaps'].flatten(0, 1)
-        pts_vis = data_dict['pts_vis'].flatten(0, 1)
-        scale_pts = torch.tensor([W, H], device=pts2d_gt.device).float()
-        pts_gt_norm = pts2d_gt / scale_pts.view(1, 1, 2)
-        pts_pred, var = integral_heatmap_layer_with_variance(heatmaps)
-        num_vis = pts_vis.sum().clamp(min=1)
-        loss_pts = (self.lossfn_pts(pts_pred, pts_gt_norm).sum(dim=-1) * pts_vis).sum() / num_vis
-        loss_var = (var * pts_vis).sum() / num_vis
-        # 6) pclouds
+        # 3) geo
+        cam_Ks = data_dict['cam_Ks'].flatten(0, 1)
+        pts3d_gt = data_dict['pts3d'].flatten(0, 1)
+        pvmaps = out_dict['pvmaps'].flatten(0, 1)
+        pts2d_pred = aggregate_corners_from_voting(pvmaps, masks_gt)
+        size_orig = data_dict['images'].shape[-2:]
+        scale_tensor = torch.tensor(
+            [size_orig[1] / size[1], size_orig[0] / size[0]], 
+            device=pts2d_pred.device, 
+            dtype=pts2d_pred.dtype
+        ).view(1, 1, 2)
+        pts2d_pred = pts2d_pred * scale_tensor
+        loss_geo = self.object_space_loss(pts2d_pred, pts3d_gt, cam_Ks)
+        # 4) pclouds
         pmaps = out_dict['pmaps'].flatten(0, 1)
         pclouds_gt = data_dict['pclouds'].flatten(0, 1)
         pconfs_gt = data_dict['pconfs'].flatten(0, 1)
@@ -232,63 +228,29 @@ class PoseLoss(nn.Module):
         loss_dict = {
             'loss_t': loss_t,
             'loss_R': loss_R,
-            'loss_add': loss_add,
             'loss_geo': loss_geo,
             'loss_mask': loss_mask,
-            'loss_pts': loss_pts,
-            'loss_var': loss_var,
             'loss_pcloud': loss_pcloud,
             'loss_pconf': loss_pconf,
         }
-        loss = loss_add + self.t_weight *loss_t + self.R_weight * loss_R + self.geo_weight * loss_geo + self.mask_weight * loss_mask + self.pts_weight * loss_pts \
-            + self.var_weight * loss_var + self.pcloud_weight * loss_pcloud + self.pconf_weight * loss_pconf
+        loss = self.t_weight * loss_t + self.R_weight * loss_R + self.mask_weight * loss_mask + \
+            + self.pcloud_weight * loss_pcloud + self.pconf_weight * loss_pconf + self.geo_weight * loss_geo
         return loss, loss_dict
-
-def se3_exp(x, eps=1e-6):
-    """
-    Batched SE(3) exponential map.
-    Args:
-        x (torch.Tensor): A tensor of shape (b, 6), v = x[..., :3] (translation), omega = x[..., 3:] (rotation).
-    Returns:
-        torch.Tensor:   A tensor of shape (b, 3, 3), representing the SO(3) transformation matrices.
-                        A tensor of shape (b, 3, 1), representing the R(3) vectors.
-    """
-    b = x.shape[0]
-    v, omega = x.split(3, dim=-1)
-
-    zeros = torch.zeros(b, 1, device=x.device, dtype=x.dtype)
-    omega_x, omega_y, omega_z = omega.split(1, dim=-1)
-    row1 = torch.cat([zeros, -omega_z, omega_y], dim=-1)
-    row2 = torch.cat([omega_z, zeros, -omega_x], dim=-1)
-    row3 = torch.cat([-omega_y, omega_x, zeros], dim=-1)
-    omega_hat = torch.stack([row1, row2, row3], dim=1) # (b, 3, 3)
-
-    theta = torch.linalg.norm(omega, dim=-1, keepdim=True).unsqueeze(-1) # (b, 1, 1)
-    small_angle_mask = theta < eps
     
-    # Use Taylor expansion for small angles
-    # A = 1 - theta^2/6, B = 1/2 - theta^2/24, C = 1/6 - theta^2/120
-    A_small = 1.0 - theta**2 / 6.0
-    B_small = 0.5 - theta**2 / 24.0
-    C_small = 1.0/6.0 - theta**2 / 120.0
-    
-    # Standard formula for large angles
-    theta_safe = theta.clamp(min=eps)
-    A_large = torch.sin(theta) / theta_safe
-    B_large = (1 - torch.cos(theta)) / theta_safe**2
-    C_large = (1 - A_large) / theta_safe**2
-
-    # Use torch.where to select based on angle magnitude
-    A = torch.where(small_angle_mask, A_small, A_large)
-    B = torch.where(small_angle_mask, B_small, B_large)
-    C = torch.where(small_angle_mask, C_small, C_large)
-
-    I = torch.eye(3, device=x.device, dtype=x.dtype).expand(b, -1, -1)
-    R = I + A * omega_hat + B * (omega_hat @ omega_hat) # (b, 3, 3)
-    V = I + B * omega_hat + C * (omega_hat @ omega_hat)
-
-    t = (V @ v.unsqueeze(-1)) # (b, 3, 1)
-    return R, t
+    def object_space_loss(self, corners_2d_pred, corners_3d_gt, cam_Ks):
+        """
+        corners_2d_pred: (N, 8, 2) 
+        corners_3d_gt:   (N, 8, 3)
+        cam_Ks:          (N, 3, 3)
+        """
+        corners_homo = torch.cat([corners_2d_pred, torch.ones_like(corners_2d_pred[..., :1])], dim=-1)
+        K_inv = torch.linalg.inv(cam_Ks)
+        rays = corners_homo @ K_inv.transpose(-1, -2)
+        rays_norm = F.normalize(rays, p=2, dim=-1) # (N, 8, 3)
+        dot_prod = (corners_3d_gt * rays_norm).sum(dim=-1, keepdim=True)
+        proj_point = dot_prod * rays_norm
+        dist_3d = torch.norm(corners_3d_gt - proj_point, p=2, dim=-1) # (N, 8)
+        return dist_3d.mean()
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     """
@@ -338,38 +300,31 @@ def compute_abs_pose(pose):
     t = T_abs[:, :, :3, 3:]   # (B, S, 3, 1)
     return R, t
 
-def integral_heatmap_layer_with_variance(heatmaps):
+def aggregate_corners_from_voting(corners_offset, mask, grid=None):
     """
-    Soft Argmax with Variance calculation
     Args:
-        heatmaps: (B, K, H, W) logits (before softmax)
+        corners_offset: (B, 2N, H, W) 
+        mask: (B, 1, H, W)
     Returns:
-        coords: (B, K, 2) normalized coordinates [0, 1]
-        variance: (B, K) spatial variance (spread of the heatmap)
+        pred_corners: (B, N, 2)
     """
-    B, K, H, W = heatmaps.shape
-    heatmaps = heatmaps.reshape(B, K, -1)
-    probs = F.softmax(heatmaps, dim=-1) # (B, K, H*W)
-    probs = probs.reshape(B, K, H, W)
+    B, C, H, W = corners_offset.shape
+    device = corners_offset.device
     
-    device = heatmaps.device
-    x_range = torch.linspace(0, 1, W, device=device)
-    y_range = torch.linspace(0, 1, H, device=device)
-    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij') # (H, W)
+    if grid is None:
+        y_range = torch.arange(H, device=device, dtype=torch.float32)
+        x_range = torch.arange(W, device=device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+        grid = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
     
-    coord_x = (probs * grid_x).sum(dim=[-2, -1]) # (B, K)
-    coord_y = (probs * grid_y).sum(dim=[-2, -1]) # (B, K)
-    coords = torch.stack([coord_x, coord_y], dim=-1) # (B, K, 2)
-    
-    # var_x = sum(P * (grid_x - coord_x)^2)
-    mu_x = coord_x.view(B, K, 1, 1)
-    mu_y = coord_y.view(B, K, 1, 1)
-    dist_sq_x = (grid_x.view(1, 1, H, W) - mu_x) ** 2
-    dist_sq_y = (grid_y.view(1, 1, H, W) - mu_y) ** 2
-    var_x = (probs * dist_sq_x).sum(dim=[-2, -1])
-    var_y = (probs * dist_sq_y).sum(dim=[-2, -1])
-    variance = var_x + var_y
-    return coords, variance
+    corners_offset = corners_offset.view(B, -1, 2, H, W)
+    grid_expand = grid.permute(2, 0, 1).view(1, 1, 2, H, W)
+    pred_dense_corners = grid_expand + corners_offset 
+    mask_expand = mask.view(B, 1, 1, H, W)
+    weighted_sum = (pred_dense_corners * mask_expand).sum(dim=(-1, -2))
+    total_weight = mask_expand.sum(dim=(-1, -2)) + 1e-6
+    pred_corners = weighted_sum / total_weight
+    return pred_corners
 
 # Training loop
 class AverageMeter(object):
@@ -409,10 +364,7 @@ def train_one_epoch(model:MyNet, dataloader, optimizer, scheduler, criterion:Pos
         loss_t_meter = AverageMeter('-')
         loss_R_meter = AverageMeter('-')
         loss_mask_meter = AverageMeter('-')
-        loss_add_meter = AverageMeter('-')
         loss_geo_meter = AverageMeter('-')
-        loss_pts_meter = AverageMeter('-')
-        loss_var_meter = AverageMeter('-')
         loss_pcloud_meter = AverageMeter('-')
         loss_pconf_meter = AverageMeter('-')
         pbar_context = tqdm(total=len(dataloader), desc=f"Epoch {epoch+1}", mininterval=1)
@@ -437,19 +389,14 @@ def train_one_epoch(model:MyNet, dataloader, optimizer, scheduler, criterion:Pos
                 loss_t_meter.update(loss_dict['loss_t'].item())
                 loss_R_meter.update(loss_dict['loss_R'].item())
                 loss_mask_meter.update(loss_dict['loss_mask'].item())
-                loss_add_meter.update(loss_dict['loss_add'].item())
                 loss_geo_meter.update(loss_dict['loss_geo'].item())
-                loss_pts_meter.update(loss_dict['loss_pts'].item())
-                loss_var_meter.update(loss_dict['loss_var'].item())
                 loss_pcloud_meter.update(loss_dict['loss_pcloud'].item())
                 loss_pconf_meter.update(loss_dict['loss_pconf'].item())
                 pbar.set_postfix({
                     'L_t': f'{loss_t_meter.avg:.4f}',
                     'L_R': f'{loss_R_meter.avg:.4f}',
-                    'L_a': f'{loss_add_meter.avg:.4f}',
                     'L_g': f'{loss_geo_meter.avg:.4f}',
                     'L_m': f'{loss_mask_meter.avg:.4f}',
-                    'L_p': f'{loss_pts_meter.avg:.4f}',
                     'L_pc': f'{loss_pcloud_meter.avg:.4f}',
                     'L_cf': f'{loss_pconf_meter.avg:.4f}',
                 })
@@ -459,11 +406,8 @@ def train_one_epoch(model:MyNet, dataloader, optimizer, scheduler, criterion:Pos
         log_data = {
             'loss_t': loss_t_meter.avg,
             'loss_R': loss_R_meter.avg,
-            'loss_add': loss_add_meter.avg,
             'loss_geo': loss_geo_meter.avg,
             'loss_mask': loss_mask_meter.avg,
-            'loss_pts': loss_pts_meter.avg,
-            'loss_var': loss_var_meter.avg,
             'loss_pcloud': loss_pcloud_meter.avg,
             'loss_pconf': loss_pconf_meter.avg,
         }

@@ -330,6 +330,26 @@ class DecoderBlock(nn.Module):
         query = query + self.drop_path(self.ls3(self.mlp(self.norm3(query))))                    # FFN
         return query
 
+class DynamicRouter(nn.Module):
+    def __init__(self, input_dim, num_layers, reduction=4):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, input_dim // reduction),
+            nn.RMSNorm(input_dim // reduction),
+            nn.ReLU(),
+            nn.Linear(input_dim // reduction, num_layers)
+        )
+        
+    def forward(self, global_token):
+        """
+        Args:
+            global_token: (B, S, C) 
+        Returns:
+            weights: (B, S, num_layers, 1) 
+        """
+        logits = self.gate(global_token) 
+        weights = F.softmax(logits, dim=-1)
+        return weights.unsqueeze(-1)
 
 ## DPT
 class ConvDw(nn.Module):
