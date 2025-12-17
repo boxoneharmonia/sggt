@@ -10,7 +10,6 @@ import bitsandbytes as bnb
 from tqdm import tqdm
 import pandas as pd
 import math
-import json
 
 from .module import *
 
@@ -61,7 +60,7 @@ class Encoder(nn.Module):
             if i in self.feature_idx:
                 cam_token = x[:,:,n] # (b s c)
                 cam_token_list.append(cam_token)
-                features = x[:,:,0:n] # (b s n c)
+                features = x[:,0,0:n] # (b n c)
                 features_list.append(features)
 
         return cam_token_list, features_list, image_size
@@ -77,66 +76,91 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        cam_layers = []
-        for i in range(config.decoder_depth):
-            cam_layers.append(MHSABlock(dim=config.embed_dim, num_heads=config.num_heads, mlp_ratio=config.mlp_ratio//2, qkv_bias=config.qkv_bias, qk_scale=config.qk_scale,
-                                        drop_ratio=config.drop_ratio, attn_drop_ratio=config.attn_drop_ratio, drop_path_ratio=config.drop_path_ratio))
-        self.cam_decoder = nn.Sequential(*cam_layers)
-        self.R_head = MLP(config.embed_dim, 6) # 6D rotation
-        self.t_head = MLP(config.embed_dim, 3)
-        self.map_head = DPTHead(inp=config.embed_dim, oup=config.maps, hidden_ratio=config.mlp_ratio//2, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
-        self.pmap_head = DPTHead(inp=config.embed_dim, oup=3, hidden_ratio=config.mlp_ratio//2, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
+        self.heads_config = config.heads
+        hidden_ratio = config.mlp_ratio // 2
         features_len = len(config.feature_idx)
-        self.cam_router = DynamicRouter(config.embed_dim, features_len)
-        self.map_routers = nn.ModuleList([
-            DynamicRouter(config.embed_dim, features_len) for _ in range(4)
-        ])
-        self.pmap_routers = nn.ModuleList([
-            DynamicRouter(config.embed_dim, features_len) for _ in range(4)
-        ])
+        if self.heads_config['pose']:
+            R_layers = []
+            t_layers = []
+            for i in range(config.decoder_depth):
+                R_layers.append(MHSABlock(dim=config.embed_dim, num_heads=config.num_heads, mlp_ratio=hidden_ratio, qkv_bias=config.qkv_bias, qk_scale=config.qk_scale,
+                                            drop_ratio=config.drop_ratio, attn_drop_ratio=config.attn_drop_ratio, drop_path_ratio=config.drop_path_ratio))
+                t_layers.append(MHSABlock(dim=config.embed_dim, num_heads=config.num_heads, mlp_ratio=hidden_ratio, qkv_bias=config.qkv_bias, qk_scale=config.qk_scale,
+                                            drop_ratio=config.drop_ratio, attn_drop_ratio=config.attn_drop_ratio, drop_path_ratio=config.drop_path_ratio))
+            self.R_decoder = nn.Sequential(*R_layers)
+            self.t_decoder = nn.Sequential(*t_layers)
+            self.R_head = MLP(config.embed_dim, 6) # 6D rotation
+            self.t_head = MLP(config.embed_dim, 3)
+            self.R_router = DynamicRouter(config.embed_dim, features_len)
+            self.t_router = DynamicRouter(config.embed_dim, features_len)
+
+        if self.heads_config['corner']:   
+            self.map_head = DPTHead(inp=config.embed_dim, oup=config.maps, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
+            self.map_routers = nn.ModuleList([
+                DynamicRouter(config.embed_dim, features_len) for _ in range(4)
+            ])
+        
+        if self.heads_config['pmap']:
+            self.pmap_head = DPTHead(inp=config.embed_dim, oup=3, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
+            self.pmap_routers = nn.ModuleList([
+                DynamicRouter(config.embed_dim, features_len) for _ in range(4)
+            ])
 
     def forward(self, cam_token_list, features_list_all, image_size):
-        global_context = cam_token_list[-1]
-        cam_weights = self.cam_router(global_context) 
-        cam_token = self._apply_dynamic_routing(cam_token_list, cam_weights)
-        cam = self.cam_decoder(cam_token)
-        pose_R_6d = self.R_head(cam)
-        pose_R = rotation_6d_to_matrix(pose_R_6d) # (b s 3 3)
-        pose_t = self.t_head(cam) # (b s 3)
-        pose = torch.cat([pose_R, pose_t[..., None]], dim=-1)
-        map_features_input = []
-        for router in self.map_routers:
-            w = router(global_context) # (B, S, L, 1)
-            feat = self._apply_dynamic_routing(features_list_all, w) # (B, S, N, C)
-            map_features_input.append(feat)
-            
-        pmap_features_input = []
-        for router in self.pmap_routers:
-            w = router(global_context)
-            feat = self._apply_dynamic_routing(features_list_all, w)
-            pmap_features_input.append(feat)
+        global_context = cam_token_list[-1][:,0]
 
-        maps = self.map_head(map_features_input, image_size)
-        mask = maps[:, :, -1:]
-        pvmap = maps[:, :, :-1]
-        pmap = self.pmap_head(pmap_features_input, image_size)
+        if self.heads_config['pose']:
+            R_weights = self.R_router(global_context) 
+            R_token = self._apply_dynamic_routing(cam_token_list, R_weights)
+            t_weights = self.t_router(global_context)
+            t_token = self._apply_dynamic_routing(cam_token_list, t_weights)
+            R_cam = self.R_decoder(R_token)[:, 0]
+            t_cam = self.t_decoder(t_token)[:, 0]
+            pose_R_6d = self.R_head(R_cam)
+            pose_R = rotation_6d_to_matrix(pose_R_6d) # (b 3 3)
+            pose_t = self.t_head(t_cam) # (b 3)
+            pose = torch.cat([pose_R, pose_t[..., None]], dim=-1)
+        else:
+            pose = None
+
+        if self.heads_config['corner']:
+            map_features_input = []
+            for router in self.map_routers:
+                w = router(global_context) # (B, L, 1)
+                feat = self._apply_dynamic_routing(features_list_all, w) # (B, N, C)
+                map_features_input.append(feat)
+            maps = self.map_head(map_features_input, image_size)
+            mask = maps[:, -1:]
+            pvmap = maps[:, :-1]
+        else:
+            mask = None
+            pvmap = None
+            
+        if self.heads_config['pmap']:
+            pmap_features_input = []
+            for router in self.pmap_routers:
+                w = router(global_context)
+                feat = self._apply_dynamic_routing(features_list_all, w)
+                pmap_features_input.append(feat)
+            pmap = self.pmap_head(pmap_features_input, image_size)
+        else:
+            pmap = None
+
         return pose, mask, pvmap, pmap
 
     def _apply_dynamic_routing(self, features_list, weights):
         """
         Args:
-            features_list: List of L tensors, each (B, S, ..., C)
-            weights: Tensor of shape (B, S, L, 1)
+            features_list: List of L tensors, each (B, ..., C)
+            weights: Tensor of shape (B, L)
         Returns:
-            fused_feature: (B, S, ..., C)
+            fused_feature: (B, ..., C)
         """
-        # Stack features: (B, S, L, ..., C)
-        stacked_feats = torch.stack(features_list, dim=2)
-        
-        # weights: (B, S, L, 1) -> (B, S, L, 1, 1) if N exists
-        while weights.ndim < stacked_feats.ndim:
-            weights = weights.unsqueeze(-1)
-        fused = (stacked_feats * weights).sum(dim=2)
+        # Stack features: (B, L, ..., C)
+        stacked_feats = torch.stack(features_list, dim=1)
+        weights = weights.unsqueeze(-1).unsqueeze(-1)
+        # Weighted sum: (B, ..., C)
+        fused = (stacked_feats * weights).sum(dim=1)
         return fused
     
 class MyNet(nn.Module):
@@ -149,10 +173,10 @@ class MyNet(nn.Module):
         cam_token_list, features_list, image_size = self.encoder(x)
         pose, mask, pvmap, pmap = self.decoder(cam_token_list, features_list, image_size)
         out_dict = {
-            'poses': pose,
-            'masks': mask,
-            'pvmaps': pvmap,
-            'pmaps': pmap
+            'pose': pose,
+            'mask': mask,
+            'pvmap': pvmap,
+            'pmap': pmap
         }
         return out_dict
 
@@ -164,7 +188,6 @@ class PoseLoss(nn.Module):
         self.lossfn_R = nn.SmoothL1Loss(reduction='mean', beta=config.R_beta)
         self.lossfn_bce_mask = nn.BCEWithLogitsLoss(reduction='mean')
         self.lossfn_bce_conf = nn.BCEWithLogitsLoss(reduction='none')
-        self.lossfn_pts = nn.MSELoss(reduction='none')
         self.pcloud_alpha = config.pcloud_alpha
 
         self.t_weight = config.t_weight
@@ -174,83 +197,125 @@ class PoseLoss(nn.Module):
         self.pcloud_weight = config.pcloud_weight
         self.pconf_weight = config.pconf_weight
 
-        ptsfile = os.path.join(config.root, config.ptsfile)
-        self.pts3d = torch.tensor(json.load(open(ptsfile, 'r'))[0]) / 1000.0 # shape (n 3)
-
     def forward(self, out_dict, data_dict, eps=1e-6):
+        loss = 0.0
+        loss_dict = {}
         # 1) pose
-        R_cams = data_dict['R_cams'].flatten(0, 1)
-        t_cams = data_dict['t_cams'].flatten(0, 1)
-        SE3_pred = out_dict['poses']
-        R_preds, t_preds = compute_abs_pose(SE3_pred)
-        R_preds = R_preds.flatten(0, 1)
-        t_preds = t_preds.flatten(0, 1)
-        loss_t = self.lossfn_t(t_preds, t_cams)
-        R_errs  = R_preds.transpose(-1, -2) @ R_cams
-        traces = R_errs.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
-        cos_theta = ((traces - 1) / 2.0).clamp(min=-1+eps, max=1-eps)
-        theta = torch.acos(cos_theta)
-        loss_R = self.lossfn_R(theta, torch.zeros_like(theta))
+        if out_dict['pose'] is not None:
+            R_cam = data_dict['R_cam']
+            t_cam = data_dict['t_cam']
+            SE3_pred = out_dict['pose']
+            R_pred, t_pred = SE3_pred[:, :3, :3], SE3_pred[:, :3, 3:]
+            loss_t = self.lossfn_t(t_pred, t_cam)
+
+            R_err  = R_pred.transpose(-1, -2) @ R_cam
+            trace = R_err.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
+            cos_theta = ((trace - 1) / 2.0).clamp(min=-1+eps, max=1-eps)
+            theta = torch.acos(cos_theta)
+            loss_R = self.lossfn_R(theta, torch.zeros_like(theta))
+
+            loss += self.t_weight * loss_t + self.R_weight * loss_R
+            loss_dict['loss_t'] = loss_t
+            loss_dict['loss_R'] = loss_R
+        else:
+            loss_dict['loss_t'] = torch.tensor(0.0)
+            loss_dict['loss_R'] = torch.tensor(0.0)
+
         # 2) mask
-        masks_pred = out_dict['masks'].flatten(0, 1)
-        masks_gt = data_dict['masks'].flatten(0, 1)
-        size = masks_pred.shape[-2:]
-        masks_gt = F.interpolate(masks_gt, size, mode='nearest-exact')
-        loss_mask = self.lossfn_bce_mask(masks_pred, masks_gt)
+        if out_dict['mask'] is not None:
+            mask_pred = out_dict['mask']
+            mask_gt = data_dict['mask']
+            size = mask_pred.shape[-2:]
+            mask_gt = F.interpolate(mask_gt, size, mode='nearest-exact')
+            loss_mask = self.lossfn_bce_mask(mask_pred, mask_gt)
+            loss += self.mask_weight * loss_mask
+            loss_dict['loss_mask'] = loss_mask
+        else:
+            loss_dict['loss_mask'] = torch.tensor(0.0)
         # 3) geo
-        cam_Ks = data_dict['cam_Ks'].flatten(0, 1)
-        pts3d_gt = data_dict['pts3d'].flatten(0, 1)
-        pvmaps = out_dict['pvmaps'].flatten(0, 1)
-        pts2d_pred = aggregate_corners_from_voting(pvmaps, masks_gt)
-        size_orig = data_dict['images'].shape[-2:]
-        scale_tensor = torch.tensor(
-            [size_orig[1] / size[1], size_orig[0] / size[0]], 
-            device=pts2d_pred.device, 
-            dtype=pts2d_pred.dtype
-        ).view(1, 1, 2)
-        pts2d_pred = pts2d_pred * scale_tensor
-        loss_geo = self.object_space_loss(pts2d_pred, pts3d_gt, cam_Ks)
+        if out_dict['pvmap'] is not None:
+            cam_K = data_dict['cam_K']
+            pts3d_gt = data_dict['pts3d']
+            pvmap = out_dict['pvmap']
+            H_orig, W_orig = data_dict['images'].shape[-2:]
+            scale_tensor = torch.tensor((W_orig, H_orig), device=pvmap.device).view(1, 1, 2)
+            loss_geo = self.voting_loss(pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor)
+            loss += self.geo_weight * loss_geo
+            loss_dict['loss_geo'] = loss_geo
+        else:
+            loss_dict['loss_geo'] = torch.tensor(0.0)
         # 4) pclouds
-        pmaps = out_dict['pmaps'].flatten(0, 1)
-        pclouds_gt = data_dict['pclouds'].flatten(0, 1)
-        pconfs_gt = data_dict['pconfs'].flatten(0, 1)
-        pclouds_gt = F.interpolate(pclouds_gt, size, mode='nearest-exact')
-        pconfs_gt = F.interpolate(pconfs_gt, size, mode='nearest-exact')
-        pclouds, pconfs_logits  = torch.split(pmaps, [3,1], dim=1)
-        pdist = torch.norm(pclouds - pclouds_gt, p=1, dim=1, keepdim=True)
-        pconfs = torch.sigmoid(pconfs_logits)
-        num_pclouds = pconfs_gt.sum() + 1e-6
-        loss_valid = (pconfs * pdist) - self.pcloud_alpha * torch.log(pconfs + 1e-6)
-        loss_pcloud = (loss_valid * pconfs_gt).sum() / num_pclouds
-        background = ((1 - masks_gt) * (1 - pconfs_gt))
-        loss_invalid = self.lossfn_bce_conf(pconfs_logits, torch.zeros_like(pconfs_logits))
-        loss_pconf = (loss_invalid * background).sum() / background.sum()
-        loss_dict = {
-            'loss_t': loss_t,
-            'loss_R': loss_R,
-            'loss_geo': loss_geo,
-            'loss_mask': loss_mask,
-            'loss_pcloud': loss_pcloud,
-            'loss_pconf': loss_pconf,
-        }
-        loss = self.t_weight * loss_t + self.R_weight * loss_R + self.mask_weight * loss_mask + \
-            + self.pcloud_weight * loss_pcloud + self.pconf_weight * loss_pconf + self.geo_weight * loss_geo
+        if out_dict['pmap'] is not None:
+            pmap = out_dict['pmap']
+            pcloud_gt = data_dict['pcloud']
+            pconf_gt = data_dict['pconf']
+            pcloud_gt = F.interpolate(pcloud_gt, size, mode='nearest-exact')
+            pconf_gt = F.interpolate(pconf_gt, size, mode='nearest-exact')
+            pcloud, pconf_logits  = torch.split(pmap, [3,1], dim=1)
+            pdist = torch.norm(pcloud - pcloud_gt, p=1, dim=1, keepdim=True)
+            pconf = torch.sigmoid(pconf_logits)
+            num_pclouds = pconf_gt.sum() + 1e-6
+            loss_valid = (pconf * pdist) - self.pcloud_alpha * torch.log(pconf + 1e-6)
+            loss_pcloud = (loss_valid * pconf_gt).sum() / num_pclouds
+            background = ((1 - mask_gt) * (1 - pconf_gt)) if mask_gt is not None else (1 - pconf_gt)
+            loss_invalid = self.lossfn_bce_conf(pconf_logits, torch.zeros_like(pconf_logits))
+            loss_pconf = (loss_invalid * background).sum() / background.sum()
+            loss += self.pcloud_weight * loss_pcloud + self.pconf_weight * loss_pconf
+            loss_dict['loss_pcloud'] = loss_pcloud
+            loss_dict['loss_pconf'] = loss_pconf
+        else:
+            loss_dict['loss_pcloud'] = torch.tensor(0.0)
+            loss_dict['loss_pconf'] = torch.tensor(0.0)
+
         return loss, loss_dict
-    
-    def object_space_loss(self, corners_2d_pred, corners_3d_gt, cam_Ks):
-        """
-        corners_2d_pred: (N, 8, 2) 
-        corners_3d_gt:   (N, 8, 3)
-        cam_Ks:          (N, 3, 3)
-        """
-        corners_homo = torch.cat([corners_2d_pred, torch.ones_like(corners_2d_pred[..., :1])], dim=-1)
-        K_inv = torch.linalg.inv(cam_Ks)
-        rays = corners_homo @ K_inv.transpose(-1, -2)
-        rays_norm = F.normalize(rays, p=2, dim=-1) # (N, 8, 3)
-        dot_prod = (corners_3d_gt * rays_norm).sum(dim=-1, keepdim=True)
-        proj_point = dot_prod * rays_norm
-        dist_3d = torch.norm(corners_3d_gt - proj_point, p=2, dim=-1) # (N, 8)
-        return dist_3d.mean()
+
+    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=True):
+        B, C, H_feat, W_feat = pvmap.shape
+        num_corners = C // 2
+        device = pvmap.device
+
+        mask_expanded = F.max_pool2d(mask_gt, kernel_size=3, stride=1, padding=1)
+
+        y_range = torch.linspace(0, 1, H_feat, device=device)
+        x_range = torch.linspace(0, 1, W_feat, device=device)
+        grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+        grid_norm = torch.stack([grid_x, grid_y], dim=-1) # (H_feat, W_feat, 2)
+        corners_offset = pvmap.view(B, num_corners, 2, H_feat, W_feat)
+        corners_2d_norm = grid_norm.view(1, 1, 2, H_feat, W_feat) + corners_offset # (B, N_corners, 2, H_feat, W_feat)
+        
+        if aggregate_first:
+            mask_for_agg = mask_expanded.view(B, 1, 1, H_feat, W_feat)
+            weighted_sum = (corners_2d_norm * mask_for_agg).sum(dim=(-1, -2))
+            total_weight = mask_for_agg.sum(dim=(-1, -2)).clamp(min=1.0)
+            corners_2d_agg_norm = weighted_sum / total_weight
+            corners_2d_scaled = corners_2d_agg_norm * scale_tensor.view(1, 1, 2)
+            corners_homo = torch.cat([corners_2d_scaled, torch.ones_like(corners_2d_scaled[:, :, :1])], dim=-1)
+            K_inv = torch.linalg.inv(cam_K)
+            rays = corners_homo @ K_inv.transpose(-1, -2)
+            rays_norm = F.normalize(rays, p=2, dim=-1)
+            dot_prod = (pts3d_gt * rays_norm).sum(dim=-1, keepdim=True)
+            proj_point = dot_prod * rays_norm
+            dist_3d = torch.norm(pts3d_gt - proj_point, p=2, dim=-1) 
+            return dist_3d.mean()
+        else:
+            voter_mask = (mask_expanded > 0.5).repeat_interleave(num_corners, dim=0)  # (B*N_corners, 1, H_feat, W_feat)
+            voter_mask = voter_mask.view(B * num_corners, H_feat * W_feat)
+            num_voters_per_image = voter_mask.sum(dim=-1).clamp(min=1.0) # (B*N_corners, )
+            scale_tensor = scale_tensor.view(1, 1, 2, 1, 1)
+            corners_2d_scaled = corners_2d_norm * scale_tensor
+            corners_homo = torch.cat([corners_2d_scaled, torch.ones_like(corners_2d_scaled[:, :, :1])], dim=2) # (B, N, 3, H, W)
+            corners_homo = rearrange(corners_homo, 'b n c h w -> (b n) (h w) c') # (B*N_corners, H_feat*W_feat, 3)
+            K_inv = torch.linalg.inv(cam_K) # (B, 3, 3)
+            K_inv_expanded = K_inv.repeat_interleave(num_corners, dim=0) # (B*N_corners, 3, 3)
+            rays = corners_homo @ K_inv_expanded.transpose(-1, -2) # (B*N_corners, H_feat*W_feat, 3)
+            rays_norm = F.normalize(rays, p=2, dim=-1)
+
+            pts3d_gt_expanded = pts3d_gt.view(B * num_corners, 1, 3).expand(-1, H_feat * W_feat, -1)
+            dot_prod = (pts3d_gt_expanded * rays_norm).sum(dim=-1, keepdim=True)
+            proj_point = dot_prod * rays_norm
+            dist_3d = torch.norm(pts3d_gt_expanded - proj_point, p=2, dim=-1) # (B*N_corners, H_feat*W_feat)
+            loss_per_corner = (dist_3d * voter_mask).sum(dim=-1) / num_voters_per_image # (B*N_corners, )
+            return loss_per_corner.mean()     
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     """
@@ -268,63 +333,6 @@ def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     b2 = F.normalize(b2, dim=-1)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-1)
-
-def compute_abs_pose(pose):
-    """
-    Computes absolute poses from a sequence of relative poses (Matrix form).
-    
-    Args:
-        pose: (B, S, 4, 4) or (B, S, 3, 4)
-              - pose[:, 0] is the reference pose (Anchor).
-              - pose[:, 1:] are the relative poses T_{ref->i}.
-    
-    Returns:
-        R: (B, S, 3, 3) Absolute rotation matrices
-        t: (B, S, 3, 1) Absolute translation vectors
-    """
-    B, S, H, W = pose.shape
-    device = pose.device
-    dtype = pose.dtype
-
-    if H == 3 and W == 4:
-        padding = torch.tensor([0, 0, 0, 1], device=device, dtype=dtype).view(1, 1, 1, 4)
-        padding = padding.expand(B, S, 1, 4)
-        pose = torch.cat([pose, padding], dim=2) # (B, S, 4, 4)
-
-    T0 = pose[:, 0] 
-    dT = pose[:, 1:]
-    T_abs = torch.zeros(B, S, 4, 4, device=device, dtype=dtype)
-    T_abs[:, 0] = T0
-    T_abs[:, 1:] = T0.unsqueeze(1) @ dT
-    R = T_abs[:, :, :3, :3]   # (B, S, 3, 3)
-    t = T_abs[:, :, :3, 3:]   # (B, S, 3, 1)
-    return R, t
-
-def aggregate_corners_from_voting(corners_offset, mask, grid=None):
-    """
-    Args:
-        corners_offset: (B, 2N, H, W) 
-        mask: (B, 1, H, W)
-    Returns:
-        pred_corners: (B, N, 2)
-    """
-    B, C, H, W = corners_offset.shape
-    device = corners_offset.device
-    
-    if grid is None:
-        y_range = torch.arange(H, device=device, dtype=torch.float32)
-        x_range = torch.arange(W, device=device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
-        grid = torch.stack([grid_x, grid_y], dim=-1) # (H, W, 2)
-    
-    corners_offset = corners_offset.view(B, -1, 2, H, W)
-    grid_expand = grid.permute(2, 0, 1).view(1, 1, 2, H, W)
-    pred_dense_corners = grid_expand + corners_offset 
-    mask_expand = mask.view(B, 1, 1, H, W)
-    weighted_sum = (pred_dense_corners * mask_expand).sum(dim=(-1, -2))
-    total_weight = mask_expand.sum(dim=(-1, -2)) + 1e-6
-    pred_corners = weighted_sum / total_weight
-    return pred_corners
 
 # Training loop
 class AverageMeter(object):

@@ -34,41 +34,39 @@ class MyDataset(Dataset):
                 n_total_frames = len(jsons[seq_key]['SE3'])
                 if n_total_frames < self.sequence_length:
                     continue
-                for i in range(n_total_frames - self.sequence_length + 1):
-                    start_idx = self.sequence_length + i
-                    self.index_map.append((seq_key, start_idx))
-        self.scale = config.scale
+                for i in range(n_total_frames): # the filename idx starts from 000001
+                    self.index_map.append((seq_key, i+1))
 
-    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale):
+    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, only_image=False):
         sequence_data = self.data[seq_name]
-        imgname = frame_idx.zfill(6) + '.jpg'
-        mskname = frame_idx.zfill(6) + '_000000.png'
-        imgpath = os.path.join(self.root_dir, seq_name, 'rgb', imgname)
-        mskpath = os.path.join(self.root_dir, seq_name, 'mask_visib', mskname)
-        image = np.array(Image.open(imgpath).convert('RGB'))
-        mask = np.array(Image.open(mskpath))
-
-        SE3_matrix = torch.tensor(sequence_data['SE3'][frame_idx], dtype=torch.float32).reshape(4,4)
-        cam_K   = torch.tensor(sequence_data['cam'][frame_idx], dtype=torch.float32).reshape(3,3)
-       
         target_h, target_w = self.size
+
+        imgname = frame_idx.zfill(6) + '.jpg'
+        imgpath = os.path.join(self.root_dir, seq_name, 'rgb', imgname)
+        image = np.array(Image.open(imgpath).convert('RGB'))
         image = cv2.warpAffine(image, M[:2], (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderValue=(128, 128, 128))
+        image = T.to_tensor(image)  
+        if self.is_train and self.transform is not None:
+            image = self.transform(image)
+
+        if only_image:
+            return image
+
+        mskname = frame_idx.zfill(6) + '_000000.png'
+        mskpath = os.path.join(self.root_dir, seq_name, 'mask_visib', mskname)
+        mask = np.array(Image.open(mskpath))
         mask = cv2.warpAffine(mask, M[:2], (target_w, target_h), flags=cv2.INTER_AREA)
+        mask  = (T.to_tensor(mask) > 0).float() 
+
+        cam_K   = torch.tensor(sequence_data['cam'][frame_idx], dtype=torch.float32).reshape(3,3)
         cam_K = torch.from_numpy(M_k).float() @ cam_K
 
+        SE3_matrix = torch.tensor(sequence_data['SE3'][frame_idx], dtype=torch.float32).reshape(4,4)
         R_cam = SE3_matrix[:3, :3]
         t_cam = SE3_matrix[:3, 3:]
         R_cam = torch.from_numpy(M_r) @ R_cam
         t_cam = torch.from_numpy(M_r) @ t_cam
         t_cam[-1] = t_cam[-1] / scale
-
-        image = T.to_tensor(image)  
-        mask  = (T.to_tensor(mask) > 0).float()    
-        if self.is_train and self.transform is not None:
-            image = self.transform(image)
-        else:
-            normalize = lambda x: T.normalize(x, mean=[0.16, 0.16, 0.16], std=[0.31, 0.31, 0.31])
-            image = normalize(image)
 
         pts3d_orig_np = np.array(self.pts3d)
         pts3d_sampled_np = sample_points_on_box(pts3d_orig_np, total_points=10000)
@@ -115,7 +113,10 @@ class MyDataset(Dataset):
 
     def __getitem__(self, idx):
         seq_name, first_idx = self.index_map[idx]
-        selected_indices = [first_idx] + [i for i in range(first_idx-self.sequence_length+1, first_idx)][::-1]
+        if first_idx < self.sequence_length:
+            selected_indices = [i for i in range(first_idx, first_idx+self.sequence_length)]
+        else:
+            selected_indices = [first_idx] + [i for i in range(first_idx-self.sequence_length+1, first_idx)][::-1]
         
         tmp_img_path = os.path.join(self.root_dir, seq_name, 'rgb', str(first_idx).zfill(6) + '.jpg')
         with Image.open(tmp_img_path) as tmp_img:
@@ -134,29 +135,25 @@ class MyDataset(Dataset):
             M_r = np.eye(3, dtype=np.float32)
             scale = 1.0
 
-        images, masks, R_cams, t_cams, pts2d, pts3d, pclouds, pconfs, cam_Ks = [], [], [], [], [], [], [], [], []
+        images = []
         for current_idx in selected_indices:
-            image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale)
-            images.append(image)
-            masks.append(mask)
-            R_cams.append(R_cam)
-            t_cams.append(t_cam)
-            pts2d.append(pts2d_corner)
-            pts3d.append(pts3d_corner)
-            pclouds.append(pcloud)
-            pconfs.append(pconf)
-            cam_Ks.append(cam_K)
+            if current_idx == selected_indices[0]:
+                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale)
+                images.append(image)
+            else:
+                image = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, only_image=True)
+                images.append(image)
 
         ret_dict = {
             'images': torch.stack(images, dim=0),
-            'masks': torch.stack(masks, dim=0),
-            'R_cams': torch.stack(R_cams, dim=0),
-            't_cams': torch.stack(t_cams, dim=0),
-            'pts2d': torch.stack(pts2d, dim=0),
-            'pts3d': torch.stack(pts3d, dim=0),
-            'pclouds': torch.stack(pclouds, dim=0),
-            'pconfs': torch.stack(pconfs, dim=0),
-            'cam_Ks': torch.stack(cam_Ks, dim=0),
+            'mask': mask,
+            'R_cam': R_cam,
+            't_cam': t_cam,
+            'pts2d': pts2d_corner,
+            'pts3d': pts3d_corner,
+            'pcloud': pcloud,
+            'pconf': pconf,
+            'cam_K': cam_K
         }
         return ret_dict
 
@@ -308,7 +305,7 @@ def build_transform():
     transforms_list.append(RandomApply(GaussianNoise()))
     transforms_list.append(RandomApply(GaussianBlur()))
     transforms_list.append(RandomApply(RandomPixelDropout()))
-    transforms_list.append(Normalize())
+    # transforms_list.append(Normalize())
 
     return Compose(transforms_list)
 

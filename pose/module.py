@@ -343,13 +343,13 @@ class DynamicRouter(nn.Module):
     def forward(self, global_token):
         """
         Args:
-            global_token: (B, S, C) 
+            global_token: (B, C) 
         Returns:
-            weights: (B, S, num_layers, 1) 
+            weights: (B, num_layers) 
         """
         logits = self.gate(global_token) 
         weights = F.softmax(logits, dim=-1)
-        return weights.unsqueeze(-1)
+        return weights
 
 ## DPT
 class ConvDw(nn.Module):
@@ -576,20 +576,18 @@ class DPTHead(nn.Module):
         self.outconf = nn.Conv2d(in_channels=features, out_channels=1, kernel_size=1, stride=1, padding=0) if use_conf is True else None
     
     def forward(self, token_list, image_size, frames_chunk_size=2):
-        B, S, N, C = token_list[0].shape
+        B, N, C = token_list[0].shape
         H, W = image_size
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
         outputs = []
-        chunk_size = frames_chunk_size if frames_chunk_size is not None else S
-        for start_idx in range(0, S, chunk_size):
-            end_idx = min(start_idx + chunk_size, S)
-            current_s = end_idx - start_idx
+        chunk_size = frames_chunk_size 
+        for start_idx in range(0, B, chunk_size):
+            end_idx = min(start_idx + chunk_size, B)
             pyramid_features = []
             for i, token in enumerate(token_list):
-                t = token[:, start_idx:end_idx]
-                t = rearrange(t, 'b s n c -> (b s) n c')
+                t = token[start_idx:end_idx]
                 t = self.norm[i](t)
-                t = rearrange(t, 'bs (h w) c -> bs c h w', h=patch_h, w=patch_w)
+                t = rearrange(t, 'b (h w) c -> b c h w', h=patch_h, w=patch_w)
                 t = self.projects[i](t)
                 
                 if self.pose_emb:
@@ -606,10 +604,9 @@ class DPTHead(nn.Module):
             if self.outconf is not None:
                 conf = self.outconf(out_features)
                 out = torch.cat([out, conf], dim=1)
-            out = out.view(B, current_s, *out.shape[1:])
             outputs.append(out)
             
-        return torch.cat(outputs, dim=1)
+        return torch.cat(outputs, dim=0)
     
     def _apply_pos_embed(self, x: torch.Tensor, W: int, H: int) -> torch.Tensor:
         """
@@ -629,6 +626,6 @@ class DPTHead(nn.Module):
         )
         
         pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
-        pos_embed = pos_embed.permute(2, 0, 1).unsqueeze(0)
+        pos_embed = pos_embed.permute(2, 0, 1)
         
         return x + pos_embed

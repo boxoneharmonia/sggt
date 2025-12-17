@@ -25,6 +25,11 @@ class Config:
         self.dpt_features = 256
         self.feature_idx = [1,3,4,5]
         self.maps = 8
+        self.heads = {
+        'pose': True,    # MLP Direct Regression (R, t)
+        'corner': True,  # Pixel-wise Voting
+        'pmap': True     # Point Map (Dense 3D)
+        }
 
         # Dataset configuration
         self.root = '../SwissCube/'
@@ -35,11 +40,10 @@ class Config:
         self.batch_size = 1
         self.num_workers = 6
         self.original_size = [336,336]
-        self.scale = 1.0
 
         # Optimizer configuration
         self.optimizer = 'adamw'
-        self.learning_rate = 5e-5
+        self.learning_rate = 1e-5
         self.weight_decay = 1e-4
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.999
