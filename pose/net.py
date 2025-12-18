@@ -115,11 +115,11 @@ class Decoder(nn.Module):
             R_token = self._apply_dynamic_routing(cam_token_list, R_weights)
             t_weights = self.t_router(global_context)
             t_token = self._apply_dynamic_routing(cam_token_list, t_weights)
-            R_cam = self.R_decoder(R_token)[:, 0]
-            t_cam = self.t_decoder(t_token)[:, 0]
+            R_cam = self.R_decoder(R_token)
+            t_cam = self.t_decoder(t_token)
             pose_R_6d = self.R_head(R_cam)
-            pose_R = rotation_6d_to_matrix(pose_R_6d) # (b 3 3)
-            pose_t = self.t_head(t_cam) # (b 3)
+            pose_R = rotation_6d_to_matrix(pose_R_6d) # (b s 3 3)
+            pose_t = self.t_head(t_cam) # (b s 3)
             pose = torch.cat([pose_R, pose_t[..., None]], dim=-1)
         else:
             pose = None
@@ -203,15 +203,16 @@ class PoseLoss(nn.Module):
         loss_dict = {}
         # 1) pose
         if out_dict['pose'] is not None:
-            R_cam = data_dict['R_cam']
-            t_cam = data_dict['t_cam']
+            R_cams = data_dict['R_cams'].flatten(0, 1)
+            t_cams = data_dict['t_cams'].flatten(0, 1)
             SE3_pred = out_dict['pose']
-            R_pred, t_pred = SE3_pred[:, :3, :3], SE3_pred[:, :3, 3:]
-            loss_t = self.lossfn_t(t_pred, t_cam)
-
-            R_err  = R_pred.transpose(-1, -2) @ R_cam
-            trace = R_err.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
-            cos_theta = ((trace - 1) / 2.0).clamp(min=-1+eps, max=1-eps)
+            R_preds, t_preds = compute_abs_pose(SE3_pred)
+            R_preds = R_preds.flatten(0, 1)
+            t_preds = t_preds.flatten(0, 1)
+            loss_t = self.lossfn_t(t_preds, t_cams)
+            R_errs  = R_preds.transpose(-1, -2) @ R_cams
+            traces = R_errs.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
+            cos_theta = ((traces - 1) / 2.0).clamp(min=-1+eps, max=1-eps)
             theta = torch.acos(cos_theta)
             loss_R = self.lossfn_R(theta, torch.zeros_like(theta))
 
@@ -270,7 +271,7 @@ class PoseLoss(nn.Module):
 
         return loss, loss_dict
 
-    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=True):
+    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=False):
         B, C, H_feat, W_feat = pvmap.shape
         num_corners = C // 2
         device = pvmap.device
@@ -279,8 +280,8 @@ class PoseLoss(nn.Module):
 
         grid_norm = GridCache.get_mesh_grid(H_feat, W_feat, device=device) # (H_feat, W_feat, 2)
         corners_offset = pvmap.view(B, num_corners, 2, H_feat, W_feat)
-        corners_2d_norm = grid_norm.view(1, 1, 2, H_feat, W_feat) + corners_offset # (B, N_corners, 2, H_feat, W_feat)
-        
+        corners_2d_norm = grid_norm + corners_offset # (B, N_corners, 2, H_feat, W_feat)
+
         if aggregate_first:
             mask_for_agg = mask_expanded.view(B, 1, 1, H_feat, W_feat)
             weighted_sum = (corners_2d_norm * mask_for_agg).sum(dim=(-1, -2))
@@ -331,6 +332,37 @@ def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     b2 = F.normalize(b2, dim=-1)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-1)
+
+def compute_abs_pose(pose):
+    """
+    Computes absolute poses from a sequence of relative poses (Matrix form).
+    
+    Args:
+        pose: (B, S, 4, 4) or (B, S, 3, 4)
+              - pose[:, 0] is the reference pose (Anchor).
+              - pose[:, 1:] are the relative poses T_{ref->i}.
+    
+    Returns:
+        R: (B, S, 3, 3) Absolute rotation matrices
+        t: (B, S, 3, 1) Absolute translation vectors
+    """
+    B, S, H, W = pose.shape
+    device = pose.device
+    dtype = pose.dtype
+
+    if H == 3 and W == 4:
+        padding = torch.tensor([0, 0, 0, 1], device=device, dtype=dtype).view(1, 1, 1, 4)
+        padding = padding.expand(B, S, 1, 4)
+        pose = torch.cat([pose, padding], dim=2) # (B, S, 4, 4)
+
+    T0 = pose[:, 0] 
+    dT = pose[:, 1:]
+    T_abs = torch.zeros(B, S, 4, 4, device=device, dtype=dtype)
+    T_abs[:, 0] = T0
+    T_abs[:, 1:] = T0.unsqueeze(1) @ dT
+    R = T_abs[:, :, :3, :3]   # (B, S, 3, 3)
+    t = T_abs[:, :, :3, 3:]   # (B, S, 3, 1)
+    return R, t
 
 # Training loop
 class AverageMeter(object):

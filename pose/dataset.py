@@ -17,13 +17,13 @@ class MyDataset(Dataset):
             jsondir = os.path.join(self.root_dir, config.testing)
 
         ptsfile = os.path.join(self.root_dir, config.ptsfile)
-        self.pts3d = json.load(open(ptsfile, 'r'))[0] # shape (n 3)
+        self.pts3d = np.array(json.load(open(ptsfile, 'r'))[0])*0.95  # shape (n 3)
         self.size = config.original_size
         self.sequence_length = config.seq_len
         self.transform = transform 
         self.is_train = is_train
         self.scale_limit = 0.2
-        self.rotate_limit = 90
+        self.rotate_limit = 180
         self.data = {}
         self.index_map = []
         json_files = sorted(os.listdir(jsondir))
@@ -37,7 +37,7 @@ class MyDataset(Dataset):
                 for i in range(n_total_frames): # the filename idx starts from 000001
                     self.index_map.append((seq_key, i+1))
 
-    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, only_image=False):
+    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, only_pose=True):
         sequence_data = self.data[seq_name]
         target_h, target_w = self.size
 
@@ -49,18 +49,6 @@ class MyDataset(Dataset):
         if self.is_train and self.transform is not None:
             image = self.transform(image)
 
-        if only_image:
-            return image
-
-        mskname = frame_idx.zfill(6) + '_000000.png'
-        mskpath = os.path.join(self.root_dir, seq_name, 'mask_visib', mskname)
-        mask = np.array(Image.open(mskpath))
-        mask = cv2.warpAffine(mask, M[:2], (target_w, target_h), flags=cv2.INTER_AREA)
-        mask  = (T.to_tensor(mask) > 0).float() 
-
-        cam_K   = torch.tensor(sequence_data['cam'][frame_idx], dtype=torch.float32).reshape(3,3)
-        cam_K = torch.from_numpy(M_k).float() @ cam_K
-
         SE3_matrix = torch.tensor(sequence_data['SE3'][frame_idx], dtype=torch.float32).reshape(4,4)
         R_cam = SE3_matrix[:3, :3]
         t_cam = SE3_matrix[:3, 3:]
@@ -68,55 +56,70 @@ class MyDataset(Dataset):
         t_cam = torch.from_numpy(M_r) @ t_cam
         t_cam[-1] = t_cam[-1] / scale
 
-        pts3d_orig_np = np.array(self.pts3d)
-        pts3d_sampled_np = sample_points_on_box(pts3d_orig_np, total_points=10000)
-        pts3d_all_np = np.concatenate([pts3d_orig_np, pts3d_sampled_np], axis=0)
-        pts3d_all = torch.from_numpy(pts3d_all_np).float() / 1000.0
+        if only_pose:
+            return (image, R_cam, t_cam)
+        else:
+            mskname = frame_idx.zfill(6) + '_000000.png'
+            mskpath = os.path.join(self.root_dir, seq_name, 'mask_visib', mskname)
+            mask = np.array(Image.open(mskpath))
+            mask = cv2.warpAffine(mask, M[:2], (target_w, target_h), flags=cv2.INTER_AREA)
+            mask  = (T.to_tensor(mask) > 0).float() 
 
-        K_tensor = cam_K
-        pts_cam_all = pts3d_all @ R_cam.t() + t_cam.view(1, 3)
-        pts3d_corner = pts_cam_all[:8]
-        pts_proj_all = pts_cam_all @ K_tensor.t()
-        pts2d_orig_all = pts_proj_all[:, :2] / (pts_proj_all[:, 2:3] + 1e-5)
-        pts2d_all = torch.zeros_like(pts2d_orig_all)
-        pts2d_all[:, 0] = pts2d_orig_all[:, 0]
-        pts2d_all[:, 1] = pts2d_orig_all[:, 1]
-        pts2d_corner = pts2d_all[:8]
+            cam_K   = torch.tensor(sequence_data['cam'][frame_idx], dtype=torch.float32).reshape(3,3)
+            cam_K = torch.from_numpy(M_k).float() @ cam_K
 
-        point_cloud = torch.zeros((3, target_h, target_w), dtype=torch.float32)
-        point_conf = torch.zeros((1, target_h, target_w), dtype=torch.float32)
-        u_coords = torch.round(pts2d_all[:, 0]).int()
-        v_coords = torch.round(pts2d_all[:, 1]).int()
-        depths = pts_cam_all[:, 2] # Z-depth
+            pts3d_orig_np = self.pts3d
+            pts3d_sampled_np = sample_points_on_box(pts3d_orig_np, total_points=10000)
+            pts3d_all_np = np.concatenate([pts3d_orig_np, pts3d_sampled_np], axis=0)
+            pts3d_all = torch.from_numpy(pts3d_all_np).float() / 1000.0
 
-        valid_indices = (u_coords >= 0) & (u_coords < target_w) & \
-                        (v_coords >= 0) & (v_coords < target_h) & \
-                        (depths > 0)
-        if valid_indices.any():
-            u_valid = u_coords[valid_indices]
-            v_valid = v_coords[valid_indices]
-            p_valid = pts_cam_all[valid_indices] # (M, 3) XYZ in Cam Frame
-            d_valid = depths[valid_indices]
-            sort_idx = torch.argsort(d_valid, descending=True)
-            u_sorted = u_valid[sort_idx]
-            v_sorted = v_valid[sort_idx]
-            p_sorted = p_valid[sort_idx]
-            point_hwc = torch.zeros((target_h, target_w, 3), dtype=torch.float32)
-            point_hwc[v_sorted, u_sorted] = p_sorted
-            point_cloud = point_hwc.permute(2, 0, 1).contiguous()
-            point_conf[:, v_sorted, u_sorted] = 1.0
+            K_tensor = cam_K
+            pts_cam_all = pts3d_all @ R_cam.t() + t_cam.view(1, 3)
+            pts3d_corner = pts_cam_all[:8]
+            pts_proj_all = pts_cam_all @ K_tensor.t()
+            pts2d_orig_all = pts_proj_all[:, :2] / (pts_proj_all[:, 2:3] + 1e-5)
+            pts2d_all = torch.zeros_like(pts2d_orig_all)
+            pts2d_all[:, 0] = pts2d_orig_all[:, 0]
+            pts2d_all[:, 1] = pts2d_orig_all[:, 1]
+            pts2d_corner = pts2d_all[:8]
 
-        return image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, point_cloud, point_conf, K_tensor
+            point_cloud = torch.zeros((3, target_h, target_w), dtype=torch.float32)
+            point_conf = torch.zeros((1, target_h, target_w), dtype=torch.float32)
+            u_coords = torch.round(pts2d_all[:, 0]).int()
+            v_coords = torch.round(pts2d_all[:, 1]).int()
+            depths = pts_cam_all[:, 2] # Z-depth
+
+            valid_indices = (u_coords >= 0) & (u_coords < target_w) & \
+                            (v_coords >= 0) & (v_coords < target_h) & \
+                            (depths > 0)
+            if valid_indices.any():
+                u_valid = u_coords[valid_indices]
+                v_valid = v_coords[valid_indices]
+                p_valid = pts_cam_all[valid_indices] # (M, 3) XYZ in Cam Frame
+                d_valid = depths[valid_indices]
+                sort_idx = torch.argsort(d_valid, descending=True)
+                u_sorted = u_valid[sort_idx]
+                v_sorted = v_valid[sort_idx]
+                p_sorted = p_valid[sort_idx]
+                point_hwc = torch.zeros((target_h, target_w, 3), dtype=torch.float32)
+                point_hwc[v_sorted, u_sorted] = p_sorted
+                point_cloud = point_hwc.permute(2, 0, 1).contiguous()
+                point_conf[:, v_sorted, u_sorted] = 1.0
+
+            return image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, point_cloud, point_conf, K_tensor
     
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         seq_name, first_idx = self.index_map[idx]
-        if first_idx < self.sequence_length:
-            selected_indices = [i for i in range(first_idx, first_idx+self.sequence_length)]
+        sample_window = self.sequence_length + 2
+        if first_idx < sample_window:
+            sampled = [i for i in range(first_idx + 1, first_idx + sample_window)]
+            selected_indices = [first_idx] + sorted(np.random.choice(sampled, self.sequence_length - 1, replace=False).tolist())
         else:
-            selected_indices = [first_idx] + [i for i in range(first_idx-self.sequence_length+1, first_idx)][::-1]
+            sampled = [i for i in range(first_idx - sample_window + 1, first_idx)]
+            selected_indices = [first_idx] + sorted(np.random.choice(sampled, self.sequence_length - 1, replace=False).tolist())[::-1]
         
         tmp_img_path = os.path.join(self.root_dir, seq_name, 'rgb', str(first_idx).zfill(6) + '.jpg')
         with Image.open(tmp_img_path) as tmp_img:
@@ -135,20 +138,24 @@ class MyDataset(Dataset):
             M_r = np.eye(3, dtype=np.float32)
             scale = 1.0
 
-        images = []
+        images, R_cams, t_cams = [], [], []
         for current_idx in selected_indices:
             if current_idx == selected_indices[0]:
-                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale)
+                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, only_pose=False)
                 images.append(image)
+                R_cams.append(R_cam)
+                t_cams.append(t_cam)
             else:
-                image = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, only_image=True)
+                image, R_cam, t_cam = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale)
                 images.append(image)
+                R_cams.append(R_cam)
+                t_cams.append(t_cam)
 
         ret_dict = {
             'images': torch.stack(images, dim=0),
             'mask': mask,
-            'R_cam': R_cam,
-            't_cam': t_cam,
+            'R_cams': torch.stack(R_cams, dim=0),
+            't_cams': torch.stack(t_cams, dim=0),
             'pts2d': pts2d_corner,
             'pts3d': pts3d_corner,
             'pcloud': pcloud,
@@ -167,7 +174,7 @@ def get_resize_matrix(h, w, target_h, target_w):
     ], dtype=np.float32)
 
 def get_center_aug_params(scale_limit, rotate_limit, target_w, target_h):
-    sfactor = np.random.uniform(1 - scale_limit, 1 + scale_limit)
+    sfactor = np.random.uniform(1, 1 + scale_limit)
     ang_deg = np.random.uniform(-rotate_limit, rotate_limit)
     ang_rad = np.deg2rad(ang_deg)
     cx = target_w / 2.0
@@ -269,7 +276,7 @@ class RandomPixelDropout(object):
     image: torch.Tensor image (C, H, W) with values between 0 ~ 1.
     dropout_ratio: The percentage of pixels to be set to 0 (e.g., 0.1 for 10%).
     """
-    def __init__(self, dropout_ratio=0.2):
+    def __init__(self, dropout_ratio=0.25):
         assert 0 <= dropout_ratio <= 1, "dropout_ratio must be between 0 and 1."
         self.dropout_ratio = dropout_ratio
 
@@ -302,7 +309,7 @@ def build_transform():
     transforms_list = []
     
     transforms_list.append(RandomApply(BrightnessContrast()))
-    transforms_list.append(RandomApply(GaussianNoise()))
+    # transforms_list.append(RandomApply(GaussianNoise()))
     transforms_list.append(RandomApply(GaussianBlur()))
     transforms_list.append(RandomApply(RandomPixelDropout()))
     # transforms_list.append(Normalize())
