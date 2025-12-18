@@ -12,6 +12,7 @@ import pandas as pd
 import math
 
 from .module import *
+from .grid_cache import GridCache
 
 class Encoder(nn.Module):
     def __init__(self, config):
@@ -276,10 +277,7 @@ class PoseLoss(nn.Module):
 
         mask_expanded = F.max_pool2d(mask_gt, kernel_size=3, stride=1, padding=1)
 
-        y_range = torch.linspace(0, 1, H_feat, device=device)
-        x_range = torch.linspace(0, 1, W_feat, device=device)
-        grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
-        grid_norm = torch.stack([grid_x, grid_y], dim=-1) # (H_feat, W_feat, 2)
+        grid_norm = GridCache.get_mesh_grid(H_feat, W_feat, device=device) # (H_feat, W_feat, 2)
         corners_offset = pvmap.view(B, num_corners, 2, H_feat, W_feat)
         corners_2d_norm = grid_norm.view(1, 1, 2, H_feat, W_feat) + corners_offset # (B, N_corners, 2, H_feat, W_feat)
         
