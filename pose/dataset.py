@@ -37,7 +37,7 @@ class MyDataset(Dataset):
                 for i in range(n_total_frames): # the filename idx starts from 000001
                     self.index_map.append((seq_key, i+1))
 
-    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, only_image=False):
+    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, only_image=False, aug_params=None):
         sequence_data = self.data[seq_name]
         target_h, target_w = self.size
 
@@ -47,7 +47,12 @@ class MyDataset(Dataset):
         image = cv2.warpAffine(image, M[:2], (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderValue=(128, 128, 128))
         image = T.to_tensor(image)  
         if self.is_train and self.transform is not None:
-            image = self.transform(image)
+            # Apply consistent transform if aug_params is provided
+            if aug_params is not None:
+                image = self.transform(image, aug_params)
+            else:
+                # Fallback or legacy behavior (though we should avoid this path for consistency)
+                image = self.transform(image)
 
         if only_image:
             return image
@@ -125,11 +130,14 @@ class MyDataset(Dataset):
         M_resize = get_resize_matrix(orig_h, orig_w, target_h, target_w)
         M_k = M_resize
 
+        aug_params = None
         if self.is_train:
             M_aug, M_r, scale = get_center_aug_params(
                 self.scale_limit, self.rotate_limit, target_w, target_h
             )
             M_total = np.matmul(M_aug, M_resize)
+            if self.transform is not None and hasattr(self.transform, 'get_params'):
+                aug_params = self.transform.get_params()
         else:
             M_total = M_resize
             M_r = np.eye(3, dtype=np.float32)
@@ -138,10 +146,10 @@ class MyDataset(Dataset):
         images = []
         for current_idx in selected_indices:
             if current_idx == selected_indices[0]:
-                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale)
+                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, aug_params=aug_params)
                 images.append(image)
             else:
-                image = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, only_image=True)
+                image = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, only_image=True, aug_params=aug_params)
                 images.append(image)
 
         ret_dict = {
@@ -203,36 +211,84 @@ def build_dataloader(config, is_train=True):
             drop_last=True)
     return dataloader
 
+# --- Consistent Sequence Transforms ---
+
+class SequenceAugmentation:
+    def __init__(self):
+        # Initialize internal transform objects with their config ranges
+        self.brightness = BrightnessContrast(alpha=(0.5, 2.0), beta=(-25, 25))
+        self.noise = GaussianNoise(std=25)
+        self.blur = GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
+        self.dropout = RandomPixelDropout(dropout_ratio=0.2)
+        # Probabilities for RandomApply
+        self.probs = {'brightness': 0.5, 'noise': 0.5, 'blur': 0.5, 'dropout': 0.5}
+
+    def get_params(self):
+        params = {}
+        # Brightness
+        if np.random.rand() < self.probs['brightness']:
+             loga = torch.rand(1) * (self.brightness.alpha[1] - self.brightness.alpha[0]) + self.brightness.alpha[0]
+             a = loga.exp()
+             b = torch.rand(1) * (self.brightness.beta[1]  - self.brightness.beta[0])  + self.brightness.beta[0]
+             params['brightness'] = {'apply': True, 'a': a, 'b': b}
+        else:
+             params['brightness'] = {'apply': False}
+
+        # Noise
+        if np.random.rand() < self.probs['noise']:
+            params['noise'] = {'apply': True}
+        else:
+            params['noise'] = {'apply': False}
+
+        # Blur
+        if np.random.rand() < self.probs['blur']:
+            sigma = float(np.random.uniform(self.blur.sigma[0], self.blur.sigma[1]))
+            params['blur'] = {'apply': True, 'sigma': sigma}
+        else:
+            params['blur'] = {'apply': False}
+
+        # Dropout
+        if np.random.rand() < self.probs['dropout']:
+            params['dropout'] = {'apply': True}
+        else:
+            params['dropout'] = {'apply': False}
+
+        return params
+
+    def __call__(self, image, params=None):
+        if params is None:
+            # Fallback to random behavior if no params provided (or one-shot use)
+            params = self.get_params()
+
+        # Apply transforms based on params
+        if params['brightness']['apply']:
+            a = params['brightness']['a']
+            b = params['brightness']['b']
+            image = torch.clamp(a*image + b, 0, 1)
+
+        if params['noise']['apply']:
+            # Call original noise logic (stochastic per call)
+            image = self.noise(image)
+
+        if params['blur']['apply']:
+            sigma = params['blur']['sigma']
+            image = T.gaussian_blur(image, kernel_size=self.blur.kernel_size, sigma=[sigma])
+
+        if params['dropout']['apply']:
+            # Call original dropout logic (stochastic per call)
+            image = self.dropout(image)
+
+        return image
+
+
 class Normalize(object):
     def __call__(self, image, *args, **kwargs):
         image = T.normalize(image, mean=[0.16, 0.16, 0.16], std=[0.31, 0.31, 0.31])
         return image
     
-class Compose(object):
-    def __init__(self, transforms):
-        self.transforms = transforms
-
-    def __call__(self, image, *args, **kwargs):
-        for t in self.transforms:
-            image = t(image, *args, **kwargs)
-        return image
-    
-class RandomApply(object):
-    def __init__(self, transform, p=0.5):
-        self.transform = transform
-        self.p = p
-
-    def __call__(self, x):
-        if np.random.rand() < self.p:
-            return self.transform(x)
-        return x
+# Keeps legacy classes for backward compatibility / internal use in SequenceAugmentation
    
 class GaussianNoise(object):
-    """ Add random Gaussian white noise
-
-        image: torch.Tensor image (0 ~ 1)
-        std:   noise standard deviation (0 ~ 255)
-    """
     def __init__(self, std=25):
         self.std = std/255
 
@@ -242,15 +298,6 @@ class GaussianNoise(object):
         return image
     
 class BrightnessContrast(object):
-    """ Adjust brightness and contrast of the image in a fashion of
-        OpenCV's convertScaleAbs, where
-
-        newImage = alpha * image + beta
-
-        image: torch.Tensor image (0 ~ 1)
-        alpha: multiplicative factor
-        beta:  additive factor (0 ~ 255)
-    """
     def __init__(self, alpha=(0.5, 2.0), beta=(-25, 25)):
         self.alpha = torch.tensor(alpha).log()
         self.beta  = torch.tensor(beta)/255
@@ -263,12 +310,6 @@ class BrightnessContrast(object):
         return image
 
 class RandomPixelDropout(object):
-    """
-    Randomly sets a certain percentage of pixels to 0.
-    
-    image: torch.Tensor image (C, H, W) with values between 0 ~ 1.
-    dropout_ratio: The percentage of pixels to be set to 0 (e.g., 0.1 for 10%).
-    """
     def __init__(self, dropout_ratio=0.2):
         assert 0 <= dropout_ratio <= 1, "dropout_ratio must be between 0 and 1."
         self.dropout_ratio = dropout_ratio
@@ -282,13 +323,6 @@ class RandomPixelDropout(object):
         return image
 
 class GaussianBlur(object):
-    """
-    Apply Gaussian blur to an image.
-    
-    image: torch.Tensor image (C, H, W) with values between 0 ~ 1.
-    kernel_size: Size of the Gaussian kernel.
-    sigma: Standard deviation of the Gaussian kernel. Can be a range (min, max).
-    """
     def __init__(self, kernel_size=5, sigma=(0.1, 2.0)):
         self.kernel_size = [kernel_size, kernel_size]
         self.sigma = sigma
@@ -299,15 +333,8 @@ class GaussianBlur(object):
         return T.gaussian_blur(image, kernel_size=self.kernel_size, sigma=sigma)
 
 def build_transform():
-    transforms_list = []
-    
-    transforms_list.append(RandomApply(BrightnessContrast()))
-    transforms_list.append(RandomApply(GaussianNoise()))
-    transforms_list.append(RandomApply(GaussianBlur()))
-    transforms_list.append(RandomApply(RandomPixelDropout()))
-    # transforms_list.append(Normalize())
-
-    return Compose(transforms_list)
+    # Return the new sequence-consistent augmentation class
+    return SequenceAugmentation()
 
 def sample_points_on_box(bbox_corners, total_points=1500):
     """
