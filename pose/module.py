@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from .grid_cache import GridCache
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """
@@ -498,45 +499,15 @@ def create_uv_grid(
 ) -> torch.Tensor:
     """
     Create a normalized UV grid of shape (height, width, 2).
-
-    The grid spans horizontally and vertically according to an aspect ratio,
-    ensuring the top-left corner is at (-x_span, -y_span) and the bottom-right
-    corner is at (x_span, y_span), normalized by the diagonal of the plane.
-
-    Args:
-        width (int): Number of points horizontally.
-        height (int): Number of points vertically.
-        aspect_ratio (float, optional): Width-to-height ratio. Defaults to width/height.
-        dtype (torch.dtype, optional): Data type of the resulting tensor.
-        device (torch.device, optional): Device on which the tensor is created.
-
-    Returns:
-        torch.Tensor: A (height, width 2) tensor of UV coordinates.
+    Uses GridCache to avoid redundant computations.
     """
-    # Derive aspect ratio if not explicitly provided
-    if aspect_ratio is None:
-        aspect_ratio = float(width) / float(height)
-
-    # Compute normalized spans for X and Y
-    diag_factor = (aspect_ratio**2 + 1.0) ** 0.5
-    span_x = aspect_ratio / diag_factor
-    span_y = 1.0 / diag_factor
-
-    # Establish the linspace boundaries
-    left_x = -span_x * (width - 1) / width
-    right_x = span_x * (width - 1) / width
-    top_y = -span_y * (height - 1) / height
-    bottom_y = span_y * (height - 1) / height
-
-    # Generate 1D coordinates
-    x_coords = torch.linspace(left_x, right_x, steps=width, dtype=dtype, device=device)
-    y_coords = torch.linspace(top_y, bottom_y, steps=height, dtype=dtype, device=device)
-
-    # Create 2D meshgrid (width x height) and stack into UV
-    uu, vv = torch.meshgrid(x_coords, y_coords, indexing="xy")
-    uv_grid = torch.stack((uu, vv), dim=-1)
-
-    return uv_grid
+    return GridCache.get_uv_grid(
+        width=width,
+        height=height,
+        aspect_ratio=aspect_ratio,
+        device=device,
+        dtype=dtype
+    )
 
 class DPTHead(nn.Module):
     def __init__(self, inp, oup, hidden_ratio=2.0, features=256, patch_size=16, pos_emb=True, activation:nn.Module=nn.Identity(), use_conf=False):
