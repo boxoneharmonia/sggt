@@ -37,7 +37,7 @@ class MyDataset(Dataset):
                 for i in range(n_total_frames): # the filename idx starts from 000001
                     self.index_map.append((seq_key, i+1))
 
-    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, only_pose=True):
+    def get_one_img(self, seq_name, frame_idx, M, M_k, M_r, scale, transform_params=None, only_pose=True):
         sequence_data = self.data[seq_name]
         target_h, target_w = self.size
 
@@ -47,7 +47,7 @@ class MyDataset(Dataset):
         image = cv2.warpAffine(image, M[:2], (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderValue=(128, 128, 128))
         image = T.to_tensor(image)  
         if self.is_train and self.transform is not None:
-            image = self.transform(image)
+            image = self.transform(image, transform_params)
 
         SE3_matrix = torch.tensor(sequence_data['SE3'][frame_idx], dtype=torch.float32).reshape(4,4)
         R_cam = SE3_matrix[:3, :3]
@@ -138,15 +138,20 @@ class MyDataset(Dataset):
             M_r = np.eye(3, dtype=np.float32)
             scale = 1.0
 
+        # Generate consistent augmentation params for the sequence
+        transform_params = None
+        if self.is_train and self.transform is not None:
+            transform_params = self.transform.get_params()
+
         images, R_cams, t_cams = [], [], []
         for current_idx in selected_indices:
             if current_idx == selected_indices[0]:
-                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, only_pose=False)
+                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, transform_params=transform_params, only_pose=False)
                 images.append(image)
                 R_cams.append(R_cam)
                 t_cams.append(t_cam)
             else:
-                image, R_cam, t_cam = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale)
+                image, R_cam, t_cam = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, transform_params=transform_params)
                 images.append(image)
                 R_cams.append(R_cam)
                 t_cams.append(t_cam)
@@ -219,9 +224,22 @@ class Compose(object):
     def __init__(self, transforms):
         self.transforms = transforms
 
-    def __call__(self, image, *args, **kwargs):
+    def get_params(self):
+        params = {}
         for t in self.transforms:
-            image = t(image, *args, **kwargs)
+            # We use the class name as the key.
+            params[type(t).__name__] = t.get_params()
+        return params
+
+    def __call__(self, image, params=None):
+        for t in self.transforms:
+            # If params is provided, look up the params for this transform type.
+            # If not provided, pass None.
+            t_params = None
+            if params is not None:
+                t_params = params.get(type(t).__name__)
+
+            image = t(image, t_params)
         return image
     
 class RandomApply(object):
@@ -240,10 +258,28 @@ class GaussianNoise(object):
         image: torch.Tensor image (0 ~ 1)
         std:   noise standard deviation (0 ~ 255)
     """
-    def __init__(self, std=25):
+    def __init__(self, std=25, p=0.5):
         self.std = std/255
+        self.p = p
 
-    def __call__(self, image, *args, **kwargs):
+    def get_params(self):
+        if np.random.rand() > self.p:
+            return {'apply': False}
+        return {'apply': True}
+
+    def __call__(self, image, params=None):
+        # Determine if we should apply
+        apply = False
+        if params is not None:
+            # Use provided params
+            apply = params.get('apply', False)
+        else:
+            # Randomly decide if params not provided
+            apply = (np.random.rand() <= self.p)
+
+        if not apply:
+            return image
+
         noise = torch.randn(image.shape, dtype=torch.float32) * self.std
         image = torch.clamp(image + noise, 0, 1)
         return image
@@ -258,14 +294,38 @@ class BrightnessContrast(object):
         alpha: multiplicative factor
         beta:  additive factor (0 ~ 255)
     """
-    def __init__(self, alpha=(0.5, 2.0), beta=(-25, 25)):
-        self.alpha = torch.tensor(alpha).log()
-        self.beta  = torch.tensor(beta)/255
+    def __init__(self, alpha=(0.5, 2.0), beta=(-25, 25), p=0.5):
+        self.alpha_range = torch.tensor(alpha).log()
+        self.beta_range  = torch.tensor(beta)/255
+        self.p = p
 
-    def __call__(self, image, *args, **kwargs):
-        loga = torch.rand(1) * (self.alpha[1] - self.alpha[0]) + self.alpha[0]
-        a = loga.exp()
-        b = torch.rand(1) * (self.beta[1]  - self.beta[0])  + self.beta[0]
+    def get_params(self):
+        if np.random.rand() > self.p:
+            return {'apply': False}
+
+        loga = torch.rand(1) * (self.alpha_range[1] - self.alpha_range[0]) + self.alpha_range[0]
+        a = loga.exp().item()
+        b = (torch.rand(1) * (self.beta_range[1]  - self.beta_range[0])  + self.beta_range[0]).item()
+        return {'apply': True, 'alpha': a, 'beta': b}
+
+    def __call__(self, image, params=None):
+        a = 1.0
+        b = 0.0
+
+        if params is not None:
+             if not params.get('apply', True):
+                 return image
+             a = params.get('alpha', 1.0)
+             b = params.get('beta', 0.0)
+        else:
+             # If params is NOT passed, use legacy random behavior
+             if np.random.rand() <= self.p:
+                loga = torch.rand(1) * (self.alpha_range[1] - self.alpha_range[0]) + self.alpha_range[0]
+                a = loga.exp().item()
+                b = (torch.rand(1) * (self.beta_range[1]  - self.beta_range[0])  + self.beta_range[0]).item()
+             else:
+                return image
+
         image = torch.clamp(a*image + b, 0, 1)
         return image
 
@@ -276,12 +336,27 @@ class RandomPixelDropout(object):
     image: torch.Tensor image (C, H, W) with values between 0 ~ 1.
     dropout_ratio: The percentage of pixels to be set to 0 (e.g., 0.1 for 10%).
     """
-    def __init__(self, dropout_ratio=0.25):
+    def __init__(self, dropout_ratio=0.25, p=0.5):
         assert 0 <= dropout_ratio <= 1, "dropout_ratio must be between 0 and 1."
         self.dropout_ratio = dropout_ratio
+        self.p = p
 
-    def __call__(self, image, *args, **kwargs):
+    def get_params(self):
+        if np.random.rand() > self.p:
+            return {'apply': False}
+        return {'apply': True}
+
+    def __call__(self, image, params=None):
         if self.dropout_ratio == 0:
+            return image
+
+        apply = False
+        if params is not None:
+            apply = params.get('apply', False)
+        else:
+            apply = (np.random.rand() <= self.p)
+
+        if not apply:
             return image
         
         mask = torch.rand(image.shape[1:], device=image.device) < self.dropout_ratio
@@ -296,22 +371,41 @@ class GaussianBlur(object):
     kernel_size: Size of the Gaussian kernel.
     sigma: Standard deviation of the Gaussian kernel. Can be a range (min, max).
     """
-    def __init__(self, kernel_size=5, sigma=(0.1, 2.0)):
+    def __init__(self, kernel_size=5, sigma=(0.1, 2.0), p=0.5):
         self.kernel_size = [kernel_size, kernel_size]
         self.sigma = sigma
+        self.p = p
 
-    def __call__(self, image, *args, **kwargs):
-        # Sample sigma from the given range
-        sigma = [float(np.random.uniform(self.sigma[0], self.sigma[1]))]
-        return T.gaussian_blur(image, kernel_size=self.kernel_size, sigma=sigma)
+    def get_params(self):
+        if np.random.rand() > self.p:
+            return {'apply': False}
+        sigma = float(np.random.uniform(self.sigma[0], self.sigma[1]))
+        return {'apply': True, 'sigma': sigma}
+
+    def __call__(self, image, params=None):
+        sigma_val = None
+
+        if params is not None:
+            if not params.get('apply', True):
+                return image
+            sigma_val = params.get('sigma')
+        else:
+             if np.random.rand() <= self.p:
+                 sigma_val = float(np.random.uniform(self.sigma[0], self.sigma[1]))
+
+        if sigma_val is None:
+            return image
+
+        # T.gaussian_blur expects sigma as list
+        return T.gaussian_blur(image, kernel_size=self.kernel_size, sigma=[sigma_val])
 
 def build_transform():
     transforms_list = []
     
-    transforms_list.append(RandomApply(BrightnessContrast()))
-    # transforms_list.append(RandomApply(GaussianNoise()))
-    transforms_list.append(RandomApply(GaussianBlur()))
-    transforms_list.append(RandomApply(RandomPixelDropout()))
+    transforms_list.append(BrightnessContrast(p=0.5))
+    # transforms_list.append(GaussianNoise(p=0.5))
+    transforms_list.append(GaussianBlur(p=0.5))
+    transforms_list.append(RandomPixelDropout(p=0.5))
     # transforms_list.append(Normalize())
 
     return Compose(transforms_list)
