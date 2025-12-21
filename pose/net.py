@@ -21,7 +21,7 @@ class Encoder(nn.Module):
         self.base = AutoModel.from_pretrained(config.base, use_safetensors=True)
         for param in self.base.parameters():
             param.requires_grad = False
-        self.num_registers = 4 # from <Vit need registers>
+        self.k_embed = CamKEmbed(config.embed_dim, config.patch_size)
         self.proj_encoder = nn.Linear(self.base.config.hidden_size, config.embed_dim) if self.base.config.hidden_size != config.embed_dim else nn.Identity()
         encoder_layers = []
         for i in range(config.encoder_depth//2):
@@ -29,13 +29,14 @@ class Encoder(nn.Module):
                                         drop_ratio=config.drop_ratio, attn_drop_ratio=config.attn_drop_ratio, drop_path_ratio=config.drop_path_ratio, groups=config.groups))
         self.encoder = nn.ModuleList(encoder_layers)
         self.cam_token = nn.Parameter(torch.zeros(1, 1, 1, config.embed_dim), requires_grad=True)
+        self.num_registers = 4 # from <Vit need registers>
         self.register = nn.Parameter(torch.zeros(1, 1, self.num_registers, config.embed_dim), requires_grad=True)
         nn.init.normal_(self.cam_token, std=1e-4)
         nn.init.normal_(self.register, std=1e-4)
         self.spatial_emb = nn.Parameter(torch.zeros(1, 1, config.num_patches + 1 + self.num_registers, config.embed_dim), requires_grad=True)
         self.feature_idx = set(config.feature_idx)
 
-    def forward(self, x:torch.Tensor):
+    def forward(self, x:torch.Tensor, coord:torch.Tensor):
         """ 
         Forward pass of the transformer.
         Args:
@@ -46,6 +47,9 @@ class Encoder(nn.Module):
         x = x.flatten(0,1)
         x = self.base(x).last_hidden_state[:,1:,:]
         x = self.proj_encoder(x)  # (bs n c)
+        coord = coord.flatten(0,1)
+        k_embed = self.k_embed(coord)
+        x = x + k_embed
         n = x.shape[1]
         x = rearrange(x, '(b s) n c -> b s n c', b=b)
 
@@ -108,7 +112,7 @@ class Decoder(nn.Module):
             ])
 
     def forward(self, cam_token_list, features_list_all, image_size):
-        global_context = cam_token_list[-1][:,0]
+        global_context = cam_token_list[-1].mean(dim=1)
 
         if self.heads_config['pose']:
             R_weights = self.R_router(global_context) 
@@ -170,8 +174,8 @@ class MyNet(nn.Module):
         self.encoder = Encoder(config)
         self.decoder = Decoder(config)
 
-    def forward(self, x:torch.Tensor):
-        cam_token_list, features_list, image_size = self.encoder(x)
+    def forward(self, x:torch.Tensor, coord:torch.Tensor):
+        cam_token_list, features_list, image_size = self.encoder(x, coord)
         pose, mask, pvmap, pmap = self.decoder(cam_token_list, features_list, image_size)
         out_dict = {
             'pose': pose,
@@ -271,19 +275,18 @@ class PoseLoss(nn.Module):
 
         return loss, loss_dict
 
-    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=False):
+    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=True):
         B, C, H_feat, W_feat = pvmap.shape
         num_corners = C // 2
         device = pvmap.device
 
-        mask_expanded = F.max_pool2d(mask_gt, kernel_size=3, stride=1, padding=1)
-
         grid_norm = GridCache.get_mesh_grid(H_feat, W_feat, device=device) # (H_feat, W_feat, 2)
+        grid_norm = grid_norm.permute(2, 0, 1)
         corners_offset = pvmap.view(B, num_corners, 2, H_feat, W_feat)
         corners_2d_norm = grid_norm + corners_offset # (B, N_corners, 2, H_feat, W_feat)
 
         if aggregate_first:
-            mask_for_agg = mask_expanded.view(B, 1, 1, H_feat, W_feat)
+            mask_for_agg = mask_gt.view(B, 1, 1, H_feat, W_feat)
             weighted_sum = (corners_2d_norm * mask_for_agg).sum(dim=(-1, -2))
             total_weight = mask_for_agg.sum(dim=(-1, -2)).clamp(min=1.0)
             corners_2d_agg_norm = weighted_sum / total_weight
@@ -297,23 +300,23 @@ class PoseLoss(nn.Module):
             dist_3d = torch.norm(pts3d_gt - proj_point, p=2, dim=-1) 
             return dist_3d.mean()
         else:
-            voter_mask = (mask_expanded > 0.5).repeat_interleave(num_corners, dim=0)  # (B*N_corners, 1, H_feat, W_feat)
-            voter_mask = voter_mask.view(B * num_corners, H_feat * W_feat)
-            num_voters_per_image = voter_mask.sum(dim=-1).clamp(min=1.0) # (B*N_corners, )
+            voter_mask = (mask_gt > 0.5).reshape(B, 1, H_feat * W_feat)
+            num_voters_per_image = voter_mask.sum(dim=-1).clamp(min=1.0) # (B, 1)
             scale_tensor = scale_tensor.view(1, 1, 2, 1, 1)
             corners_2d_scaled = corners_2d_norm * scale_tensor
-            corners_homo = torch.cat([corners_2d_scaled, torch.ones_like(corners_2d_scaled[:, :, :1])], dim=2) # (B, N, 3, H, W)
-            corners_homo = rearrange(corners_homo, 'b n c h w -> (b n) (h w) c') # (B*N_corners, H_feat*W_feat, 3)
+            corners_2d_scaled = corners_2d_scaled.flatten(3)
+            corners_homo = torch.cat([corners_2d_scaled, torch.ones_like(corners_2d_scaled[:, :, :1, :])], dim=2)
+            corners_homo = corners_homo.permute(0, 1, 3, 2)
             K_inv = torch.linalg.inv(cam_K) # (B, 3, 3)
-            K_inv_expanded = K_inv.repeat_interleave(num_corners, dim=0) # (B*N_corners, 3, 3)
-            rays = corners_homo @ K_inv_expanded.transpose(-1, -2) # (B*N_corners, H_feat*W_feat, 3)
+            rays = corners_homo @ K_inv.transpose(-1, -2).unsqueeze(1)
             rays_norm = F.normalize(rays, p=2, dim=-1)
 
-            pts3d_gt_expanded = pts3d_gt.view(B * num_corners, 1, 3).expand(-1, H_feat * W_feat, -1)
-            dot_prod = (pts3d_gt_expanded * rays_norm).sum(dim=-1, keepdim=True)
-            proj_point = dot_prod * rays_norm
-            dist_3d = torch.norm(pts3d_gt_expanded - proj_point, p=2, dim=-1) # (B*N_corners, H_feat*W_feat)
-            loss_per_corner = (dist_3d * voter_mask).sum(dim=-1) / num_voters_per_image # (B*N_corners, )
+            pts3d_gt_expanded = pts3d_gt.unsqueeze(2)
+            dot_prod = (pts3d_gt_expanded * rays_norm).sum(dim=-1, keepdim=True) # (B, N, HW, 1)
+            proj_point = dot_prod * rays_norm # (B, N, HW, 3)
+            dist_3d = torch.norm(pts3d_gt_expanded - proj_point, p=2, dim=-1) # (B, N, HW)
+            loss_per_corner = (dist_3d * voter_mask).sum(dim=-1) # (B, N)
+            loss_per_corner = loss_per_corner / num_voters_per_image
             return loss_per_corner.mean()     
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
@@ -413,8 +416,9 @@ def train_one_epoch(model:MyNet, dataloader, optimizer, scheduler, criterion:Pos
     with pbar_context as pbar:
         for idx, data_dict in enumerate(dataloader):
             images = data_dict['images']
+            coords = data_dict['coords']
             with accelerator.accumulate(model):
-                pred = model(images)
+                pred = model(images, coords)
                 loss, loss_dict = criterion(pred, data_dict)
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -467,12 +471,28 @@ def build_optimizer(model:MyNet, config):
     Returns:
         torch.optim.Optimizer: The optimizer instance.
     """
+    r_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        if 'decoder.R_head' in name or 'decoder.R_decoder' in name:
+            r_params.append(param)
+        else:
+            other_params.append(param)
     params = [
         {
-            "params": model.parameters(),
+            "params": other_params,
             "lr": config.learning_rate
+        },
+        {
+            "params": r_params,
+            "lr": config.learning_rate * 1.0,
         }
     ]
+
     if config.optimizer == 'adamw':
         optimizer = optim.AdamW(params, weight_decay=config.weight_decay, betas=(config.adam_beta1, config.adam_beta2))
     elif config.optimizer == 'adamw8bit':

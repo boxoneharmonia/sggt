@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from .grid_cache import GridCache
+import math
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """
@@ -351,6 +352,57 @@ class DynamicRouter(nn.Module):
         logits = self.gate(global_token) 
         weights = F.softmax(logits, dim=-1)
         return weights
+
+class SinusoidalEncoder(nn.Module):
+    def __init__(self, num_freqs=10, include_input=True):
+        super().__init__()
+        self.num_freqs = num_freqs
+        self.include_input = include_input
+        freq_bands = 2.0 ** torch.linspace(0.0, num_freqs - 1, num_freqs)
+        self.register_buffer("freq_bands", freq_bands)
+
+    def forward(self, coords):
+        """
+        coords: (B, 2, H, W)
+        Return: (B, out_dim, H, W)
+        """
+        args = coords.unsqueeze(-1) * self.freq_bands * math.pi
+        sin_vals = torch.sin(args)
+        cos_vals = torch.cos(args)
+        features = torch.cat([sin_vals, cos_vals], dim=-1)
+        features = features.permute(0, 1, 4, 2, 3).flatten(1, 2)
+        if self.include_input:
+            features = torch.cat([coords, features], dim=1)
+            
+        return features
+        
+    def get_out_dim(self):
+        dim = 2 * 2 * self.num_freqs
+        if self.include_input:
+            dim += 2
+        return dim
+
+class CamKEmbed(nn.Module):
+    def __init__(self, 
+                embed_dim=768, 
+                patch_size=14, 
+                num_freqs=10):
+        super().__init__()
+        self.patch_size = patch_size
+        self.ray_encoder = SinusoidalEncoder(num_freqs=num_freqs)
+        ray_in_dim = self.ray_encoder.get_out_dim()
+        self.proj_ray = nn.Sequential(
+            nn.Linear(ray_in_dim, embed_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim, bias=False),
+        )
+
+    def forward(self, coord_map):
+        patch_coords = F.avg_pool2d(coord_map, kernel_size=self.patch_size, stride=self.patch_size)
+        x_ray_encoded = self.ray_encoder(patch_coords) 
+        x_ray_encoded = x_ray_encoded.flatten(2).transpose(1, 2)
+        x = self.proj_ray(x_ray_encoded)
+        return x
 
 ## DPT
 class ConvDw(nn.Module):

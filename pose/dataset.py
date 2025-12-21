@@ -6,6 +6,7 @@ from PIL import Image
 import os
 import json
 import cv2
+import random
 
 class MyDataset(Dataset):
     def __init__(self, config, transform, is_train=True):
@@ -22,8 +23,8 @@ class MyDataset(Dataset):
         self.sequence_length = config.seq_len
         self.transform = transform 
         self.is_train = is_train
-        self.scale_limit = 0.2
-        self.rotate_limit = 180
+        self.scale_limit = 0.0
+        self.rotate_limit = 0
         self.data = {}
         self.index_map = []
         json_files = sorted(os.listdir(jsondir))
@@ -44,7 +45,8 @@ class MyDataset(Dataset):
         imgname = frame_idx.zfill(6) + '.jpg'
         imgpath = os.path.join(self.root_dir, seq_name, 'rgb', imgname)
         image = np.array(Image.open(imgpath).convert('RGB'))
-        image = cv2.warpAffine(image, M[:2], (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderValue=(128, 128, 128))
+        orig_h, orig_w, _ = image.shape
+        image = cv2.warpAffine(image, M[:2], (orig_w, orig_h), flags=cv2.INTER_LANCZOS4, borderValue=(128, 128, 128))
         image = T.to_tensor(image)  
         if self.is_train and self.transform is not None:
             image = self.transform(image, transform_params)
@@ -56,19 +58,55 @@ class MyDataset(Dataset):
         t_cam = torch.from_numpy(M_r) @ t_cam
         t_cam[-1] = t_cam[-1] / scale
 
+        mskname = frame_idx.zfill(6) + '_000000.png'
+        mskpath = os.path.join(self.root_dir, seq_name, 'mask_visib', mskname)
+        mask = np.array(Image.open(mskpath))
+        mask = cv2.warpAffine(mask, M[:2], (orig_w, orig_h), flags=cv2.INTER_AREA)
+        mask  = T.to_tensor(mask)
+        
+        y_coords, x_coords = torch.where(mask.squeeze(0) > 0)
+        ymin = int(y_coords.min() * 0.95)
+        ymax = int(y_coords.max() * 1.05)
+        xmin = int(x_coords.min() * 0.95)
+        xmax = int(x_coords.max() * 1.05)
+        width = xmax - xmin
+        height = ymax - ymin
+        center_x = (xmin + xmax) / 2.0
+        center_y = (ymin + ymax) / 2.0
+        if self.is_train:
+            center_x = center_x + random.uniform(-0.01, 0.01) * width
+            center_y = center_y + random.uniform(-0.01, 0.01) * height
+            width = random.uniform(0.9, 1.0) * width
+            height = random.uniform(0.9, 1.0) * height
+        crop_size = int(max(width, height))
+        xmin = int(center_x - crop_size / 2.0)
+        ymin = int(center_y - crop_size / 2.0)
+        xmin = max(0, min(xmin, orig_w - crop_size))
+        ymin = max(0, min(ymin, orig_h - crop_size))
+        xmax = xmin + crop_size
+        ymax = ymin + crop_size
+        # bbox = torch.tensor([xmin/orig_w, ymin/orig_h, xmax/orig_w, ymax/orig_h]).float() 
+        image = T.resized_crop(image, ymin, xmin, crop_size, crop_size, self.size, interpolation=T.InterpolationMode.BILINEAR)
+        mask = T.resized_crop(mask, ymin, xmin, crop_size, crop_size, self.size, interpolation=T.InterpolationMode.BILINEAR)
+        mask = (mask > 0.0).float()
+
+        cam_K = torch.tensor(sequence_data['cam'][frame_idx], dtype=torch.float32).reshape(3,3)
+        cam_K = torch.from_numpy(M_k).float() @ cam_K
+        scale_x = target_w / crop_size
+        scale_y = target_h / crop_size
+        K_crop = torch.tensor([
+            [scale_x, 0,          -xmin * scale_x],
+            [0,          scale_y, -ymin * scale_y],
+            [0,          0,          1]
+        ], dtype=torch.float32)
+        cam_K = K_crop @ cam_K
+
+        coord_map = generate_coord_map(target_h, target_w, cam_K)
+
         if only_pose:
-            return (image, R_cam, t_cam)
+            return (image, coord_map, R_cam, t_cam)
         else:
-            mskname = frame_idx.zfill(6) + '_000000.png'
-            mskpath = os.path.join(self.root_dir, seq_name, 'mask_visib', mskname)
-            mask = np.array(Image.open(mskpath))
-            mask = cv2.warpAffine(mask, M[:2], (target_w, target_h), flags=cv2.INTER_AREA)
-            mask  = (T.to_tensor(mask) > 0).float() 
-
-            cam_K   = torch.tensor(sequence_data['cam'][frame_idx], dtype=torch.float32).reshape(3,3)
-            cam_K = torch.from_numpy(M_k).float() @ cam_K
-
-            pts3d_orig_np = self.pts3d
+            pts3d_orig_np = self.pts3d.copy()
             pts3d_sampled_np = sample_points_on_box(pts3d_orig_np, total_points=10000)
             pts3d_all_np = np.concatenate([pts3d_orig_np, pts3d_sampled_np], axis=0)
             pts3d_all = torch.from_numpy(pts3d_all_np).float() / 1000.0
@@ -106,7 +144,7 @@ class MyDataset(Dataset):
                 point_cloud = point_hwc.permute(2, 0, 1).contiguous()
                 point_conf[:, v_sorted, u_sorted] = 1.0
 
-            return image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, point_cloud, point_conf, K_tensor
+            return image, coord_map, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, point_cloud, point_conf, K_tensor
     
     def __len__(self):
         return len(self.index_map)
@@ -143,24 +181,27 @@ class MyDataset(Dataset):
         if self.is_train and self.transform is not None:
             transform_params = self.transform.get_params()
 
-        images, R_cams, t_cams = [], [], []
+        images, coords, R_cams, t_cams = [], [], [], []
         for current_idx in selected_indices:
             if current_idx == selected_indices[0]:
-                image, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, transform_params=transform_params, only_pose=False)
+                image, coord_map, mask, R_cam, t_cam, pts2d_corner, pts3d_corner, pcloud, pconf, cam_K = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, transform_params=transform_params, only_pose=False)
                 images.append(image)
+                coords.append(coord_map)
                 R_cams.append(R_cam)
                 t_cams.append(t_cam)
             else:
-                image, R_cam, t_cam = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, transform_params=transform_params)
+                image, coord_map, R_cam, t_cam = self.get_one_img(seq_name, str(current_idx), M_total, M_k, M_r, scale, transform_params=transform_params)
                 images.append(image)
+                coords.append(coord_map)
                 R_cams.append(R_cam)
                 t_cams.append(t_cam)
 
         ret_dict = {
             'images': torch.stack(images, dim=0),
-            'mask': mask,
+            'coords': torch.stack(coords, dim=0),
             'R_cams': torch.stack(R_cams, dim=0),
             't_cams': torch.stack(t_cams, dim=0),
+            'mask': mask,
             'pts2d': pts2d_corner,
             'pts3d': pts3d_corner,
             'pcloud': pcloud,
@@ -194,6 +235,21 @@ def get_center_aug_params(scale_limit, rotate_limit, target_w, target_h):
         [0,     0,     1]
     ], dtype=np.float32)
     return M_aug_3x3, M_rot, sfactor
+
+def generate_coord_map(height, width, K):
+    xs, ys = torch.meshgrid(
+        torch.arange(width, dtype=torch.float32), 
+        torch.arange(height, dtype=torch.float32), 
+        indexing='xy'
+    )
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+    coord_x = (xs - cx) / fx
+    coord_y = (ys - cy) / fy
+    coord_map = torch.stack([coord_x, coord_y], dim=0)
+    return coord_map
 
 def build_dataloader(config, is_train=True):
     """ Build a DataLoader for the EventSequenceDataset. """
@@ -294,7 +350,7 @@ class BrightnessContrast(object):
         alpha: multiplicative factor
         beta:  additive factor (0 ~ 255)
     """
-    def __init__(self, alpha=(0.5, 2.0), beta=(-25, 25), p=0.5):
+    def __init__(self, alpha=(0.5, 2.0), beta=(-10, 10), p=0.5):
         self.alpha_range = torch.tensor(alpha).log()
         self.beta_range  = torch.tensor(beta)/255
         self.p = p
