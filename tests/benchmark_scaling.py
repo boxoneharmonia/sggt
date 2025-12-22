@@ -4,13 +4,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import sys
 import os
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--cpu', action="store_true")
+args = parser.parse_args()
 
 # Add repo root to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from pose.module import AltAttBlock, AltRefAttBlock
 
-def benchmark_speed(model, input_tensor, iterations=20, warmup=5):
+def benchmark_speed(model, input_tensor, iterations=30, warmup=20):
     # Warmup
     model.eval()
     with torch.no_grad():
@@ -28,13 +33,17 @@ def benchmark_speed(model, input_tensor, iterations=20, warmup=5):
     return avg_time * 1000  # Convert to ms
 
 def run_scaling_benchmark():
-    print("=== Benchmarking Scaling with Sequence Length (CPU) ===")
+    if args.cpu:
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"=== Benchmarking Scaling with Sequence Length ({device}) ===")
 
     # Configuration
-    dim = 256
-    num_heads = 8
+    dim = 768
+    num_heads = 16
     batch_size = 1
-    num_tokens = 64  # Keep N fixed, vary S
+    num_tokens = 16*16  # Keep N fixed, vary S
     seq_lengths = [4, 8, 16, 32, 64]
 
     times_alt = []
@@ -45,11 +54,11 @@ def run_scaling_benchmark():
     print("-" * 45)
 
     for s in seq_lengths:
-        input_tensor = torch.randn(batch_size, s, num_tokens, dim)
+        input_tensor = torch.randn(batch_size, s, num_tokens, dim).to(device)
 
         # Instantiate Models (Re-init to be safe, though not strictly necessary)
-        model_alt = AltAttBlock(dim=dim, num_heads=num_heads)
-        model_ref = AltRefAttBlock(dim=dim, num_heads=num_heads)
+        model_alt = AltAttBlock(dim=dim, num_heads=num_heads).to(device)
+        model_ref = AltRefAttBlock(dim=dim, num_heads=num_heads).to(device)
 
         t_alt = benchmark_speed(model_alt, input_tensor)
         t_ref = benchmark_speed(model_ref, input_tensor)
@@ -71,13 +80,13 @@ def run_scaling_benchmark():
     plt.legend()
 
     # Add trend annotations
-    plt.annotate('Quadratic Growth O(S^2)', xy=(seq_lengths[-2], times_alt[-2]),
-                 xytext=(seq_lengths[-2], times_alt[-2] + 50),
-                 arrowprops=dict(facecolor='black', shrink=0.05))
+    # plt.annotate('Quadratic Growth O(S^2)', xy=(seq_lengths[-2], times_alt[-2]),
+    #              xytext=(seq_lengths[-2], times_alt[-2] + 50),
+    #              arrowprops=dict(facecolor='black', shrink=0.05))
 
-    plt.annotate('Linear Growth O(S)', xy=(seq_lengths[-2], times_ref[-2]),
-                 xytext=(seq_lengths[-2], times_ref[-2] - 50),
-                 arrowprops=dict(facecolor='black', shrink=0.05))
+    # plt.annotate('Linear Growth O(S)', xy=(seq_lengths[-2], times_ref[-2]),
+    #              xytext=(seq_lengths[-2], times_ref[-2] - 50),
+    #              arrowprops=dict(facecolor='black', shrink=0.05))
 
     output_path = os.path.join(os.path.dirname(__file__), 'scaling_comparison.png')
     plt.savefig(output_path)

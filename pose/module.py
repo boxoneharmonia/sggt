@@ -168,65 +168,6 @@ class AltAttBlock(nn.Module):
         x = rearrange(x, '(b s) n c -> b s n c', s=s)
         return x
 
-class AltRefAttBlock(nn.Module):
-    def __init__(self,
-                 dim,
-                 num_heads,
-                 groups=1,
-                 mlp_ratio=4.0,
-                 qkv_bias=False,
-                 qk_scale=None,
-                 drop_ratio=0.,
-                 attn_drop_ratio=0.,
-                 drop_path_ratio=0.,
-                 norm_layer=nn.RMSNorm,
-                 ):
-        super().__init__()
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.norm1 = norm_layer(dim)
-        self.attn1 = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio, groups=groups)
-        self.norm2 = norm_layer(dim)
-        self.mlp2 = MLPSwiGLU(dim, hidden=mlp_hidden_dim, drop=drop_ratio, norm=norm_layer)
-        self.norm3 = norm_layer(dim)
-        self.attn3 = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio, groups=groups)
-        self.norm4 = norm_layer(dim)
-        self.mlp4 = MLPSwiGLU(dim, hidden=mlp_hidden_dim, drop=drop_ratio, norm=norm_layer)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
-        self.drop_path = DropPath(drop_path_ratio) if drop_path_ratio > 0. else nn.Identity()
-        self.ls1 = LayerScale(dim)
-        self.ls2 = LayerScale(dim)
-        self.ls3 = LayerScale(dim)
-        self.ls4 = LayerScale(dim)
-        self.aggregation_proj = nn.Linear(dim, 1)
-
-    def forward(self, x):
-        s = x.shape[1]
-        x_norm = self.norm1(x)
-        x_ref = x_norm[:, 0] # (b, n, c)
-        x_ref = x_ref.unsqueeze(1).expand(-1, s - 1, -1, -1) # (b, s-1, n, c)
-        x_oth = x_norm[:, 1:] # (b, s-1, n, c)
-        x_pair = torch.cat([x_ref, x_oth], dim=2)
-        x_pair = rearrange(x_pair, 'b s n c -> (b s) n c', s=s-1)
-        x_pair_att = self.attn1(x_pair)
-        x_pair_att = rearrange(x_pair_att, '(b s) n c -> b s n c', s=s-1)
-        x_ref_att, x_oth_att = x_pair_att.chunk(2, dim=2)
-        agg_weights = self.aggregation_proj(x_ref_att)
-        agg_weights = F.softmax(agg_weights, dim=1)
-        x_ref_att = (x_ref_att * agg_weights).sum(dim=1, keepdim=True)
-        x_att = torch.cat([x_ref_att, x_oth_att], dim=1)
-        x_att = rearrange(x_att, 'b s n c -> b (s n) c', s=s)
-
-        x = rearrange(x, 'b s n c -> b (s n) c', s=s)
-        x = x + self.drop_path(self.ls1(x_att))
-        x = x + self.drop_path(self.ls2(self.mlp2(self.norm2(x))))
-        x = rearrange(x, 'b (s n) c -> (b s) n c', s=s)
-        x = x + self.drop_path(self.ls3(self.attn3(self.norm3(x))))
-        x = x + self.drop_path(self.ls4(self.mlp4(self.norm4(x))))
-        x = rearrange(x, '(b s) n c -> b s n c', s=s)
-        return x
-
 class MHSABlock(nn.Module):
     def __init__(self,
                  dim,
@@ -259,20 +200,23 @@ class MHSABlock(nn.Module):
 
 class CrossAttention(nn.Module):
     def __init__(self,
-                 dim,
+                 dim,   # 输入token的dim
                  num_heads=8,
                  qkv_bias=False,
                  qk_scale=None,
                  attn_drop_ratio=0.,
-                 proj_drop_ratio=0.):
-        super().__init__()
+                 proj_drop_ratio=0.,
+                 groups=1):
+        super(CrossAttention, self).__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-
+        self.head_dim = dim // num_heads
+        self.kv_heads = num_heads // groups
+        self.groups = groups
+        self.scale = qk_scale or self.head_dim ** -0.5
+        self.q_dim = num_heads * self.head_dim
+        self.kv_dim = self.kv_heads * self.head_dim
+        self.q = nn.Linear(dim, self.q_dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, self.kv_dim * 2, bias=qkv_bias)
         self.attn_drop = attn_drop_ratio
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop_ratio)
@@ -281,8 +225,10 @@ class CrossAttention(nn.Module):
         B, N, C = query.shape
         _, M, _ = memory.shape
 
-        q = self.q(query).reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
-        kv = self.kv(memory).reshape(B, M, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q = self.q(query)
+        q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        kv = self.kv(memory)
+        kv = kv.reshape(B, M, 2, self.kv_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
@@ -295,6 +241,63 @@ class CrossAttention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        return x
+
+class AltRefAttBlock(nn.Module):
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 groups=1,
+                 mlp_ratio=4.0,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 drop_ratio=0.,
+                 attn_drop_ratio=0.,
+                 drop_path_ratio=0.,
+                 norm_layer=nn.RMSNorm,
+                 ):
+        super().__init__()
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.norm1 = norm_layer(dim)
+        self.attn1 = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio, groups=groups)
+        self.norm2 = norm_layer(dim)
+        self.mlp2 = MLPSwiGLU(dim, hidden=mlp_hidden_dim, drop=drop_ratio, norm=norm_layer)
+        self.norm3 = norm_layer(dim)
+        self.attn3 = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio, groups=groups)
+        self.norm4 = norm_layer(dim)
+        self.mlp4 = MLPSwiGLU(dim, hidden=mlp_hidden_dim, drop=drop_ratio, norm=norm_layer)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path_ratio) if drop_path_ratio > 0. else nn.Identity()
+        self.ls1 = LayerScale(dim)
+        self.ls2 = LayerScale(dim)
+        self.ls3 = LayerScale(dim)
+        self.ls4 = LayerScale(dim)
+        self.aggregation_proj = nn.Linear(dim, 1)
+
+    def forward(self, x):
+        s = x.shape[1]
+        x_norm = self.norm1(x)
+        x_ref = x_norm[:, 0] # (b, n, c)
+        x_oth = x_norm[:, 1:].flatten(1, 2) # (b, (s-1)*n, c)
+
+        x_oth_att = self.attn1(x_oth, x_ref)
+        agg_weights = self.aggregation_proj(x_oth_att)
+        agg_weights = rearrange(agg_weights, 'b (s_1 n) 1 -> b s_1 n 1', s_1=s-1)
+        agg_weights = F.softmax(agg_weights, dim=1)
+        x_oth_att_reshaped = rearrange(x_oth_att, 'b (s_1 n) c -> b s_1 n c', s_1=s-1)
+        x_ref_att = (x_oth_att_reshaped * agg_weights).sum(dim=1, keepdim=True)
+        x_att = torch.cat([x_ref_att, x_oth_att_reshaped], dim=1)
+        x_att = rearrange(x_att, 'b s n c -> b (s n) c')
+
+        x = rearrange(x, 'b s n c -> b (s n) c', s=s)
+        x = x + self.drop_path(self.ls1(x_att))
+        x = x + self.drop_path(self.ls2(self.mlp2(self.norm2(x))))
+        x = rearrange(x, 'b (s n) c -> (b s) n c', s=s)
+        x = x + self.drop_path(self.ls3(self.attn3(self.norm3(x))))
+        x = x + self.drop_path(self.ls4(self.mlp4(self.norm4(x))))
+        x = rearrange(x, '(b s) n c -> b s n c', s=s)
         return x
 
 class DecoderBlock(nn.Module):
