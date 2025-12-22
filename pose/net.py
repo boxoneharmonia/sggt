@@ -244,7 +244,7 @@ class PoseLoss(nn.Module):
             pts3d_gt = data_dict['pts3d']
             pvmap = out_dict['pvmap']
             H_orig, W_orig = data_dict['images'].shape[-2:]
-            scale_tensor = torch.tensor((W_orig, H_orig), device=pvmap.device).view(1, 1, 2)
+            scale_tensor = torch.tensor((W_orig-1., H_orig-1.), device=pvmap.device).view(1, 1, 2)
             loss_geo = self.voting_loss(pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor)
             loss += self.geo_weight * loss_geo
             loss_dict['loss_geo'] = loss_geo
