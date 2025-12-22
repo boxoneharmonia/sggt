@@ -40,11 +40,11 @@ def run_scaling_benchmark():
     print(f"=== Benchmarking Scaling with Sequence Length ({device}) ===")
 
     # Configuration
-    dim = 768
+    dim = 256
     num_heads = 16
     batch_size = 1
-    num_tokens = 16*16  # Keep N fixed, vary S
-    seq_lengths = [4, 8, 16, 32, 64]
+    num_tokens = 36*36  # Keep N fixed, vary S
+    seq_lengths = [4, 8, 16, 32]
 
     times_alt = []
     times_ref = []

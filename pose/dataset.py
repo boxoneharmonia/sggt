@@ -23,8 +23,8 @@ class MyDataset(Dataset):
         self.sequence_length = config.seq_len
         self.transform = transform 
         self.is_train = is_train
-        self.scale_limit = 0.0
-        self.rotate_limit = 0
+        self.scale_limit = 0.1
+        self.rotate_limit = 180
         self.data = {}
         self.index_map = []
         json_files = sorted(os.listdir(jsondir))
