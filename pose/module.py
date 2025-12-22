@@ -259,7 +259,7 @@ class AltRefAttBlock(nn.Module):
         super().__init__()
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.norm1 = norm_layer(dim)
-        self.attn1 = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+        self.attn1 = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
                                 attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio, groups=groups)
         self.norm2 = norm_layer(dim)
         self.mlp2 = MLPSwiGLU(dim, hidden=mlp_hidden_dim, drop=drop_ratio, norm=norm_layer)
@@ -280,19 +280,21 @@ class AltRefAttBlock(nn.Module):
         b, s, n, c = x.shape
         x_norm = self.norm1(x)
         x_ref = x_norm[:, 0] # (b, n, c)
-        x_oth = x_norm[:, 1:].flatten(1, 2) # (b, (s-1)*n, c)
-
-        x_oth_att = self.attn1(x_oth, x_ref)
-        agg_weights = self.aggregation_proj(x_oth_att)
-        agg_weights = agg_weights.view(b, s-1, n, 1)
+        x_ref_expanded = x_ref.unsqueeze(1).expand(-1, s - 1, -1, -1) # (b, s-1, n, c)
+        x_oth = x_norm[:, 1:]
+        x_pair = torch.cat([x_ref_expanded, x_oth], dim=2)
+        x_pair_flat = x_pair.flatten(0, 1)
+        x_pair_att = self.attn1(x_pair_flat)
+        x_pair_att = x_pair_att.view(b, s - 1, 2 * n, c)
+        x_ref_updated_copies, x_oth_updated = x_pair_att.split(n, dim=2)
+        agg_weights = self.aggregation_proj(x_ref_updated_copies) # (b, s-1, n, 1)
         agg_weights = F.softmax(agg_weights, dim=1)
-        x_oth_att_reshaped = x_oth_att.view(b, s-1, n, c)
-        x_ref_att = (x_oth_att_reshaped * agg_weights).sum(dim=1, keepdim=True)
-        x_att = torch.cat([x_ref_att, x_oth_att_reshaped], dim=1)
-        x_att = x_att.view(b, s*n, c)
+        x_ref_final = (x_ref_updated_copies * agg_weights).sum(dim=1)
+        x_ref_out = x[:, 0] + self.drop_path(self.ls1(x_ref_final))
+        x_oth_out = x[:, 1:] + self.drop_path(self.ls1(x_oth_updated))
+        x = torch.cat([x_ref_out.unsqueeze(1), x_oth_out], dim=1) # (b, s, n, c)
 
         x = x.view(b, s*n, c)
-        x = x + self.drop_path(self.ls1(x_att))
         x = x + self.drop_path(self.ls2(self.mlp2(self.norm2(x))))
         x = x.view(b*s, n, c)
         x = x + self.drop_path(self.ls3(self.attn3(self.norm3(x))))
