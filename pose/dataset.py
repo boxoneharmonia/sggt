@@ -24,7 +24,6 @@ class MyDataset(Dataset):
         self.transform = transform 
         self.is_train = is_train
         self.scale_limit = 0.1
-        self.rotate_limit = 180
         self.data = {}
         self.index_map = []
         json_files = sorted(os.listdir(jsondir))
@@ -168,7 +167,7 @@ class MyDataset(Dataset):
 
         if self.is_train:
             M_aug, M_r, scale = get_center_aug_params(
-                self.scale_limit, self.rotate_limit, target_w, target_h
+                self.scale_limit, target_w, target_h
             )
             M_total = np.matmul(M_aug, M_resize)
         else:
@@ -219,9 +218,9 @@ def get_resize_matrix(h, w, target_h, target_w):
         [0, 0, 1]
     ], dtype=np.float32)
 
-def get_center_aug_params(scale_limit, rotate_limit, target_w, target_h):
+def get_center_aug_params(scale_limit, target_w, target_h):
     sfactor = np.random.uniform(1, 1 + scale_limit)
-    ang_deg = np.random.uniform(-rotate_limit, rotate_limit)
+    ang_deg = float(np.random.choice([0, 90, 180, 270]))
     ang_rad = np.deg2rad(ang_deg)
     cx = target_w / 2.0
     cy = target_h / 2.0

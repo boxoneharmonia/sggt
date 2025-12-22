@@ -501,7 +501,7 @@ def build_optimizer(model:MyNet, config):
         },
         {
             "params": r_params,
-            "lr": config.learning_rate * 1.0,
+            "lr": config.learning_rate * 2.0,
         }
     ]
 

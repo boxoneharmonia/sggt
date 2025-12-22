@@ -83,7 +83,7 @@ class Attention(nn.Module):
                 enable_gqa=True if self.groups != 1 else False
             )
         x = x.transpose(1, 2)
-        x = rearrange(x, 'b n h c -> b n (h c)')
+        x = x.flatten(2)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x    
@@ -158,14 +158,14 @@ class AltAttBlock(nn.Module):
         self.ls4 = LayerScale(dim)
 
     def forward(self, x):
-        s = x.shape[1]
-        x = rearrange(x, 'b s n c -> b (s n) c', s=s)
+        b, s, n, c = x.shape
+        x = x.view(b, s*n, c)
         x = x + self.drop_path(self.ls1(self.attn1(self.norm1(x))))
         x = x + self.drop_path(self.ls2(self.mlp2(self.norm2(x))))
-        x = rearrange(x, 'b (s n) c -> (b s) n c', s=s)
+        x = x.view(b*s, n, c)
         x = x + self.drop_path(self.ls3(self.attn3(self.norm3(x))))
         x = x + self.drop_path(self.ls4(self.mlp4(self.norm4(x))))
-        x = rearrange(x, '(b s) n c -> b s n c', s=s)
+        x = x.view(b, s, n, c)
         return x
 
 class MHSABlock(nn.Module):
@@ -277,63 +277,28 @@ class AltRefAttBlock(nn.Module):
         self.aggregation_proj = nn.Linear(dim, 1)
 
     def forward(self, x):
-        s = x.shape[1]
+        b, s, n, c = x.shape
         x_norm = self.norm1(x)
         x_ref = x_norm[:, 0] # (b, n, c)
         x_oth = x_norm[:, 1:].flatten(1, 2) # (b, (s-1)*n, c)
 
         x_oth_att = self.attn1(x_oth, x_ref)
         agg_weights = self.aggregation_proj(x_oth_att)
-        agg_weights = rearrange(agg_weights, 'b (s_1 n) 1 -> b s_1 n 1', s_1=s-1)
+        agg_weights = agg_weights.view(b, s-1, n, 1)
         agg_weights = F.softmax(agg_weights, dim=1)
-        x_oth_att_reshaped = rearrange(x_oth_att, 'b (s_1 n) c -> b s_1 n c', s_1=s-1)
+        x_oth_att_reshaped = x_oth_att.view(b, s-1, n, c)
         x_ref_att = (x_oth_att_reshaped * agg_weights).sum(dim=1, keepdim=True)
         x_att = torch.cat([x_ref_att, x_oth_att_reshaped], dim=1)
-        x_att = rearrange(x_att, 'b s n c -> b (s n) c')
+        x_att = x_att.view(b, s*n, c)
 
-        x = rearrange(x, 'b s n c -> b (s n) c', s=s)
+        x = x.view(b, s*n, c)
         x = x + self.drop_path(self.ls1(x_att))
         x = x + self.drop_path(self.ls2(self.mlp2(self.norm2(x))))
-        x = rearrange(x, 'b (s n) c -> (b s) n c', s=s)
+        x = x.view(b*s, n, c)
         x = x + self.drop_path(self.ls3(self.attn3(self.norm3(x))))
         x = x + self.drop_path(self.ls4(self.mlp4(self.norm4(x))))
-        x = rearrange(x, '(b s) n c -> b s n c', s=s)
+        x = x.view(b, s, n, c)
         return x
-
-class DecoderBlock(nn.Module):
-    def __init__(self,
-                 dim,
-                 num_heads,
-                 seq_len,
-                 mlp_ratio=4.0,
-                 qkv_bias=False,
-                 qk_scale=None,
-                 drop_ratio=0.0,
-                 attn_drop_ratio=0.0,
-                 drop_path_ratio=0.0,
-                 norm_layer=nn.RMSNorm):
-        super().__init__()
-        self.sequence_lenth = seq_len
-        self.norm1 = norm_layer(dim)
-        self.self_attn = Attention(dim, num_heads, qkv_bias, qk_scale, attn_drop_ratio, drop_ratio)
-        self.norm2 = norm_layer(dim)
-        self.cross_attn = CrossAttention(dim, num_heads, qkv_bias, qk_scale, attn_drop_ratio, drop_ratio)
-        self.drop_path = DropPath(drop_path_ratio) if drop_path_ratio > 0. else nn.Identity()
-        self.norm3 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MLPSwiGLU(dim, hidden=mlp_hidden_dim, drop=drop_ratio, norm=norm_layer)
-        self.ls1 = LayerScale(dim)
-        self.ls2 = LayerScale(dim)
-        self.ls3 = LayerScale(dim)
-
-    def forward(self, query, memory):
-        s = self.sequence_lenth
-        query = rearrange(query, '(b s) n c -> b (s n) c', s=s)
-        query = query + self.drop_path(self.ls1(self.self_attn(self.norm1(query))))              # Self-Attention
-        query = rearrange(query, 'b (s n) c -> (b s) n c', s=s)
-        query = query + self.drop_path(self.ls2(self.cross_attn(self.norm2(query), memory)))     # Cross-Attention
-        query = query + self.drop_path(self.ls3(self.mlp(self.norm3(query))))                    # FFN
-        return query
 
 class DynamicRouter(nn.Module):
     def __init__(self, input_dim, num_layers, reduction=4):
