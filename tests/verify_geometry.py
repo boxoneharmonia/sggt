@@ -39,10 +39,9 @@ def verify_geometry():
     print(f"World 3D Points:\n{pts3d_world}\n")
 
     # 2. Simulate Dataset Projection (3D -> 2D)
-    # Removing epsilon for pure geometric verification
     pts_cam = pts3d_world @ R_cam.t() + t_cam.view(1, 3)
     pts_proj = pts_cam @ cam_K.t()
-    pts2d_gt = pts_proj[:, :2] / pts_proj[:, 2:3] # No epsilon
+    pts2d_gt = pts_proj[:, :2] / pts_proj[:, 2:3]
 
     print(f"Camera Frame 3D Points:\n{pts_cam}")
     print(f"Projected 2D Points (Pixels):\n{pts2d_gt}\n")
@@ -80,10 +79,11 @@ def verify_geometry():
     print("\n--- Verifying Grid Coordinate System Consistency ---")
 
     # Dataset assumes pixels are 0..W-1 (integer coordinates)
-    # Loss assumes pixels are generated from GridCache (0..1) * Scale (W)
+    # Loss assumes pixels are generated from GridCache (0..1) * Scale (W-1)
 
     grid_w_steps = torch.linspace(0, 1, W)
-    scaled_w_steps = grid_w_steps * W
+    # UPDATED: Scale by W-1 to match the fix in pose/net.py
+    scaled_w_steps = grid_w_steps * (W - 1)
     arange_w = torch.arange(W, dtype=torch.float32)
 
     diff = (scaled_w_steps - arange_w).abs()
@@ -92,8 +92,6 @@ def verify_geometry():
 
     if max_diff > 1e-3:
         print("FAILURE: The loss function's grid generation does not match the dataset's pixel coordinate system.")
-        print(f"Dataset Range: [0, {W-1}]")
-        print(f"Loss Grid Range: [0, {scaled_w_steps[-1].item():.4f}]")
     else:
         print("PASS: Coordinate systems match.")
 
