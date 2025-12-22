@@ -1,6 +1,5 @@
 from pose.dataset import *
 from pose.net import *
-from pose.loss_optimized import PoseLossOptimized
 import os
 from accelerate import Accelerator, DistributedDataParallelKwargs
 import torch
@@ -72,7 +71,7 @@ def train():
         model, optimizer, trainloader, scheduler
     )
 
-    criterion = PoseLossOptimized(config)
+    criterion = PoseLoss(config)
     model.train()
 
     start_epoch = 0

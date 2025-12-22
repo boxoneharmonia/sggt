@@ -285,15 +285,24 @@ class PoseLoss(nn.Module):
         corners_offset = pvmap.view(B, num_corners, 2, H_feat, W_feat)
         corners_2d_norm = grid_norm + corners_offset # (B, N_corners, 2, H_feat, W_feat)
 
+        fx = cam_K[:, 0, 0].view(B, 1, 1)
+        fy = cam_K[:, 1, 1].view(B, 1, 1)
+        cx = cam_K[:, 0, 2].view(B, 1, 1)
+        cy = cam_K[:, 1, 2].view(B, 1, 1)
+
         if aggregate_first:
             mask_for_agg = mask_gt.view(B, 1, 1, H_feat, W_feat)
             weighted_sum = (corners_2d_norm * mask_for_agg).sum(dim=(-1, -2))
             total_weight = mask_for_agg.sum(dim=(-1, -2)).clamp(min=1.0)
             corners_2d_agg_norm = weighted_sum / total_weight
             corners_2d_scaled = corners_2d_agg_norm * scale_tensor.view(1, 1, 2)
-            corners_homo = torch.cat([corners_2d_scaled, torch.ones_like(corners_2d_scaled[:, :, :1])], dim=-1)
-            K_inv = torch.linalg.inv(cam_K)
-            rays = corners_homo @ K_inv.transpose(-1, -2)
+            u = corners_2d_scaled[..., 0]
+            v = corners_2d_scaled[..., 1]
+            ray_x = (u - cx) / fx
+            ray_y = (v - cy) / fy
+            ray_z = torch.ones_like(ray_x)
+
+            rays = torch.stack([ray_x, ray_y, ray_z], dim=-1)
             rays_norm = F.normalize(rays, p=2, dim=-1)
             dot_prod = (pts3d_gt * rays_norm).sum(dim=-1, keepdim=True)
             proj_point = dot_prod * rays_norm
@@ -305,10 +314,13 @@ class PoseLoss(nn.Module):
             scale_tensor = scale_tensor.view(1, 1, 2, 1, 1)
             corners_2d_scaled = corners_2d_norm * scale_tensor
             corners_2d_scaled = corners_2d_scaled.flatten(3)
-            corners_homo = torch.cat([corners_2d_scaled, torch.ones_like(corners_2d_scaled[:, :, :1, :])], dim=2)
-            corners_homo = corners_homo.permute(0, 1, 3, 2)
-            K_inv = torch.linalg.inv(cam_K) # (B, 3, 3)
-            rays = corners_homo @ K_inv.transpose(-1, -2).unsqueeze(1)
+            u = corners_2d_scaled[:, :, 0, :] # (B, N, HW)
+            v = corners_2d_scaled[:, :, 1, :] # (B, N, HW)
+            ray_x = (u - cx) / fx
+            ray_y = (v - cy) / fy
+            ray_z = torch.ones_like(ray_x)
+
+            rays = torch.stack([ray_x, ray_y, ray_z], dim=-1)
             rays_norm = F.normalize(rays, p=2, dim=-1)
 
             pts3d_gt_expanded = pts3d_gt.unsqueeze(2)
