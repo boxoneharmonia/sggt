@@ -58,17 +58,16 @@ class Encoder(nn.Module):
         x = torch.cat((x, cam_tokens, registers), dim=2)   # (b s n+1+4 c)
         temporal_pe = self.get_sinusoidal_encoding(s, self.embed_dim, x.device, x.dtype)
         x = x + self.spatial_emb + temporal_pe
-        cam_token_list = []
         features_list = []
         for i, layer in enumerate(self.encoder):
             x = layer(x)
             if i in self.feature_idx:
                 cam_token = x[:,:,n] # (b s c)
-                cam_token_list.append(cam_token)
                 features = x[:,0,0:n] # (b n c)
                 features_list.append(features)
 
-        return cam_token_list, features_list, image_size
+        cam_token = x[:,:,n] # (b s c)
+        return cam_token, features_list, image_size
 
     def get_sinusoidal_encoding(self, seq_len, dim, device, dtype):
         position = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
@@ -96,31 +95,18 @@ class Decoder(nn.Module):
             self.t_decoder = nn.Sequential(*t_layers)
             self.R_head = MLP(config.embed_dim, 6) # 6D rotation
             self.t_head = MLP(config.embed_dim, 3)
-            self.R_router = DynamicRouter(config.embed_dim, features_len)
-            self.t_router = DynamicRouter(config.embed_dim, features_len)
 
         if self.heads_config['corner']:   
             self.map_head = DPTHead(inp=config.embed_dim, oup=config.maps, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
-            self.map_routers = nn.ModuleList([
-                DynamicRouter(config.embed_dim, features_len) for _ in range(4)
-            ])
         
         if self.heads_config['pmap']:
             self.pmap_head = DPTHead(inp=config.embed_dim, oup=3, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
-            self.pmap_routers = nn.ModuleList([
-                DynamicRouter(config.embed_dim, features_len) for _ in range(4)
-            ])
 
-    def forward(self, cam_token_list, features_list_all, image_size):
-        global_context = cam_token_list[-1].mean(dim=1)
+    def forward(self, cam_token, features_list, image_size):
 
         if self.heads_config['pose']:
-            R_weights = self.R_router(global_context) 
-            R_token = self._apply_dynamic_routing(cam_token_list, R_weights)
-            t_weights = self.t_router(global_context)
-            t_token = self._apply_dynamic_routing(cam_token_list, t_weights)
-            R_cam = self.R_decoder(R_token)
-            t_cam = self.t_decoder(t_token)
+            R_cam = self.R_decoder(cam_token)
+            t_cam = self.t_decoder(cam_token)
             pose_R_6d = self.R_head(R_cam)
             pose_R = rotation_6d_to_matrix(pose_R_6d) # (b s 3 3)
             pose_t = self.t_head(t_cam) # (b s 3)
@@ -129,12 +115,7 @@ class Decoder(nn.Module):
             pose = None
 
         if self.heads_config['corner']:
-            map_features_input = []
-            for router in self.map_routers:
-                w = router(global_context) # (B, L, 1)
-                feat = self._apply_dynamic_routing(features_list_all, w) # (B, N, C)
-                map_features_input.append(feat)
-            maps = self.map_head(map_features_input, image_size)
+            maps = self.map_head(features_list, image_size)
             mask = maps[:, -1:]
             pvmap = maps[:, :-1]
         else:
@@ -142,31 +123,11 @@ class Decoder(nn.Module):
             pvmap = None
             
         if self.heads_config['pmap']:
-            pmap_features_input = []
-            for router in self.pmap_routers:
-                w = router(global_context)
-                feat = self._apply_dynamic_routing(features_list_all, w)
-                pmap_features_input.append(feat)
-            pmap = self.pmap_head(pmap_features_input, image_size)
+            pmap = self.pmap_head(features_list, image_size)
         else:
             pmap = None
 
         return pose, mask, pvmap, pmap
-
-    def _apply_dynamic_routing(self, features_list, weights):
-        """
-        Args:
-            features_list: List of L tensors, each (B, ..., C)
-            weights: Tensor of shape (B, L)
-        Returns:
-            fused_feature: (B, ..., C)
-        """
-        # Stack features: (B, L, ..., C)
-        stacked_feats = torch.stack(features_list, dim=1)
-        weights = weights.unsqueeze(-1).unsqueeze(-1)
-        # Weighted sum: (B, ..., C)
-        fused = (stacked_feats * weights).sum(dim=1)
-        return fused
     
 class MyNet(nn.Module):
     def __init__(self, config):
@@ -175,8 +136,8 @@ class MyNet(nn.Module):
         self.decoder = Decoder(config)
 
     def forward(self, x:torch.Tensor, coord:torch.Tensor):
-        cam_token_list, features_list, image_size = self.encoder(x, coord)
-        pose, mask, pvmap, pmap = self.decoder(cam_token_list, features_list, image_size)
+        cam_token, features_list, image_size = self.encoder(x, coord)
+        pose, mask, pvmap, pmap = self.decoder(cam_token, features_list, image_size)
         out_dict = {
             'pose': pose,
             'mask': mask,
@@ -245,7 +206,7 @@ class PoseLoss(nn.Module):
             pvmap = out_dict['pvmap']
             H_orig, W_orig = data_dict['images'].shape[-2:]
             scale_tensor = torch.tensor((W_orig-1., H_orig-1.), device=pvmap.device).view(1, 1, 2)
-            loss_geo = self.voting_loss(pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor)
+            loss_geo = self.voting_loss(pvmap, torch.sigmoid(mask_pred), pts3d_gt, cam_K, scale_tensor)
             loss += self.geo_weight * loss_geo
             loss_dict['loss_geo'] = loss_geo
         else:
@@ -275,7 +236,7 @@ class PoseLoss(nn.Module):
 
         return loss, loss_dict
 
-    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=True):
+    def voting_loss(self, pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor):
         B, C, H_feat, W_feat = pvmap.shape
         num_corners = C // 2
         device = pvmap.device
@@ -290,46 +251,27 @@ class PoseLoss(nn.Module):
         cx = cam_K[:, 0, 2].view(B, 1, 1)
         cy = cam_K[:, 1, 2].view(B, 1, 1)
 
-        if aggregate_first:
-            mask_for_agg = mask_gt.view(B, 1, 1, H_feat, W_feat)
-            weighted_sum = (corners_2d_norm * mask_for_agg).sum(dim=(-1, -2))
-            total_weight = mask_for_agg.sum(dim=(-1, -2)).clamp(min=1.0)
-            corners_2d_agg_norm = weighted_sum / total_weight
-            corners_2d_scaled = corners_2d_agg_norm * scale_tensor.view(1, 1, 2)
-            u = corners_2d_scaled[..., 0]
-            v = corners_2d_scaled[..., 1]
-            ray_x = (u - cx) / fx
-            ray_y = (v - cy) / fy
-            ray_z = torch.ones_like(ray_x)
+        voter_mask = (mask_gt > 0.5).reshape(B, 1, H_feat * W_feat)
+        num_voters_per_image = voter_mask.sum(dim=-1).clamp(min=1.0) # (B, 1)
+        scale_tensor = scale_tensor.view(1, 1, 2, 1, 1)
+        corners_2d_scaled = corners_2d_norm * scale_tensor
+        corners_2d_scaled = corners_2d_scaled.flatten(3)
+        u = corners_2d_scaled[:, :, 0, :] # (B, N, HW)
+        v = corners_2d_scaled[:, :, 1, :] # (B, N, HW)
+        ray_x = (u - cx) / fx
+        ray_y = (v - cy) / fy
+        ray_z = torch.ones_like(ray_x)
 
-            rays = torch.stack([ray_x, ray_y, ray_z], dim=-1)
-            rays_norm = F.normalize(rays, p=2, dim=-1)
-            dot_prod = (pts3d_gt * rays_norm).sum(dim=-1, keepdim=True)
-            proj_point = dot_prod * rays_norm
-            dist_3d = torch.norm(pts3d_gt - proj_point, p=2, dim=-1) 
-            return dist_3d.mean()
-        else:
-            voter_mask = (mask_gt > 0.5).reshape(B, 1, H_feat * W_feat)
-            num_voters_per_image = voter_mask.sum(dim=-1).clamp(min=1.0) # (B, 1)
-            scale_tensor = scale_tensor.view(1, 1, 2, 1, 1)
-            corners_2d_scaled = corners_2d_norm * scale_tensor
-            corners_2d_scaled = corners_2d_scaled.flatten(3)
-            u = corners_2d_scaled[:, :, 0, :] # (B, N, HW)
-            v = corners_2d_scaled[:, :, 1, :] # (B, N, HW)
-            ray_x = (u - cx) / fx
-            ray_y = (v - cy) / fy
-            ray_z = torch.ones_like(ray_x)
+        rays = torch.stack([ray_x, ray_y, ray_z], dim=-1)
+        rays_norm = F.normalize(rays, p=2, dim=-1)
 
-            rays = torch.stack([ray_x, ray_y, ray_z], dim=-1)
-            rays_norm = F.normalize(rays, p=2, dim=-1)
-
-            pts3d_gt_expanded = pts3d_gt.unsqueeze(2)
-            dot_prod = (pts3d_gt_expanded * rays_norm).sum(dim=-1, keepdim=True) # (B, N, HW, 1)
-            proj_point = dot_prod * rays_norm # (B, N, HW, 3)
-            dist_3d = torch.norm(pts3d_gt_expanded - proj_point, p=2, dim=-1) # (B, N, HW)
-            loss_per_corner = (dist_3d * voter_mask).sum(dim=-1) # (B, N)
-            loss_per_corner = loss_per_corner / num_voters_per_image
-            return loss_per_corner.mean()     
+        pts3d_gt_expanded = pts3d_gt.unsqueeze(2)
+        dot_prod = (pts3d_gt_expanded * rays_norm).sum(dim=-1, keepdim=True) # (B, N, HW, 1)
+        proj_point = dot_prod * rays_norm # (B, N, HW, 3)
+        dist_3d = torch.norm(pts3d_gt_expanded - proj_point, p=2, dim=-1) # (B, N, HW)
+        loss_per_corner = (dist_3d * voter_mask).sum(dim=-1) # (B, N)
+        loss_per_corner = loss_per_corner / num_voters_per_image
+        return loss_per_corner.mean()     
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     """
@@ -501,7 +443,7 @@ def build_optimizer(model:MyNet, config):
         },
         {
             "params": r_params,
-            "lr": config.learning_rate * 2.0,
+            "lr": config.learning_rate * 1.0,
         }
     ]
 

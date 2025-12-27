@@ -302,27 +302,6 @@ class AltRefAttBlock(nn.Module):
         x = x.view(b, s, n, c)
         return x
 
-class DynamicRouter(nn.Module):
-    def __init__(self, input_dim, num_layers, reduction=4):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Linear(input_dim, input_dim // reduction),
-            nn.RMSNorm(input_dim // reduction),
-            nn.ReLU(),
-            nn.Linear(input_dim // reduction, num_layers)
-        )
-        
-    def forward(self, global_token):
-        """
-        Args:
-            global_token: (B, C) 
-        Returns:
-            weights: (B, num_layers) 
-        """
-        logits = self.gate(global_token) 
-        weights = F.softmax(logits, dim=-1)
-        return weights
-
 class SinusoidalEncoder(nn.Module):
     def __init__(self, num_freqs=10, include_input=True):
         super().__init__()
