@@ -16,12 +16,14 @@ class PoseLossOptimized(PoseLoss):
         num_corners = C // 2
         device = pvmap.device
 
-        fx = cam_K[:, 0, 0].view(B, 1, 1)
-        fy = cam_K[:, 1, 1].view(B, 1, 1)
-        cx = cam_K[:, 0, 2].view(B, 1, 1)
-        cy = cam_K[:, 1, 2].view(B, 1, 1)
-
         if aggregate_first:
+            # Reshape camera parameters for (B, N) broadcasting
+            # (B, 1) is safer than (B, 1, 1) when working with (B, N) tensors to avoid (B, B, N) broadcasting
+            fx = cam_K[:, 0, 0].view(B, 1)
+            fy = cam_K[:, 1, 1].view(B, 1)
+            cx = cam_K[:, 0, 2].view(B, 1)
+            cy = cam_K[:, 1, 2].view(B, 1)
+
             # Flatten spatial dimensions
             L = H_feat * W_feat
 
@@ -58,8 +60,11 @@ class PoseLossOptimized(PoseLoss):
             corners_2d_agg_norm = weighted_sum / total_weight # (B, N, 2)
             corners_2d_scaled = corners_2d_agg_norm * scale_tensor.view(1, 1, 2)
 
-            u = corners_2d_scaled[..., 0]
-            v = corners_2d_scaled[..., 1]
+            u = corners_2d_scaled[..., 0] # (B, N)
+            v = corners_2d_scaled[..., 1] # (B, N)
+
+            # Ray calculation
+            # u: (B, N), cx: (B, 1) -> (B, N)
             ray_x = (u - cx) / fx
             ray_y = (v - cy) / fy
             ray_z = torch.ones_like(ray_x)
@@ -72,7 +77,4 @@ class PoseLossOptimized(PoseLoss):
             return dist_3d.mean()
         else:
             # Fallback to original implementation for aggregate_first=False
-            # We need to reconstruct the original logic or call super().voting_loss
-            # calling super().voting_loss is cleaner but might re-do some setup.
-            # But since aggregate_first=False uses different logic, it's safer to just call super
             return super().voting_loss(pvmap, mask_gt, pts3d_gt, cam_K, scale_tensor, aggregate_first=False)
