@@ -73,8 +73,8 @@ class MyDataset(Dataset):
         center_x = (xmin + xmax) / 2.0
         center_y = (ymin + ymax) / 2.0
         if self.is_train:
-            center_x = center_x + random.uniform(-0.01, 0.01) * width
-            center_y = center_y + random.uniform(-0.01, 0.01) * height
+            center_x = center_x + random.uniform(-0.1, 0.1) * width
+            center_y = center_y + random.uniform(-0.1, 0.1) * height
             width = random.uniform(0.9, 1.0) * width
             height = random.uniform(0.9, 1.0) * height
         crop_size = int(max(width, height))

@@ -206,7 +206,8 @@ class PoseLoss(nn.Module):
             pvmap = out_dict['pvmap']
             H_orig, W_orig = data_dict['images'].shape[-2:]
             scale_tensor = torch.tensor((W_orig-1., H_orig-1.), device=pvmap.device).view(1, 1, 2)
-            loss_geo = self.voting_loss(pvmap, torch.sigmoid(mask_pred), pts3d_gt, cam_K, scale_tensor)
+            mask = torch.sigmoid(mask_pred) if loss_mask.item() < 0.1 else mask_gt
+            loss_geo = self.voting_loss(pvmap, mask, pts3d_gt, cam_K, scale_tensor)
             loss += self.geo_weight * loss_geo
             loss_dict['loss_geo'] = loss_geo
         else:
