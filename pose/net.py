@@ -12,6 +12,7 @@ import pandas as pd
 import math
 
 from .module import *
+from .optimized_dpt import OptimizedDPTHead
 from .grid_cache import GridCache
 
 class Encoder(nn.Module):
@@ -97,10 +98,10 @@ class Decoder(nn.Module):
             self.t_head = MLP(config.embed_dim, 3)
 
         if self.heads_config['corner']:   
-            self.map_head = DPTHead(inp=config.embed_dim, oup=config.maps, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
+            self.map_head = OptimizedDPTHead(inp=config.embed_dim, oup=config.maps, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
         
         if self.heads_config['pmap']:
-            self.pmap_head = DPTHead(inp=config.embed_dim, oup=3, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
+            self.pmap_head = OptimizedDPTHead(inp=config.embed_dim, oup=3, hidden_ratio=hidden_ratio, features=config.dpt_features, patch_size=config.patch_size, use_conf=True)
 
     def forward(self, cam_token, features_list, image_size):
 
